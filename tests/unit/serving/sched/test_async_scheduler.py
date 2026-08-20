@@ -72,6 +72,183 @@ def _prefill_scheduler(*, num_blocks=8, block_size=128, prefix_cache=False, **co
     return Scheduler(SchedulerConfig(enable_prefix_cache=prefix_cache, **config), manager)
 
 
+def _grouped_scheduler(
+    *,
+    num_blocks=64,
+    block_size=1,
+    max_blocks_per_seq=16,
+    **config,
+):
+    manager = KvCacheManager(block_size=block_size, enable_prefix_cache=False)
+    manager.init_groups(
+        (
+            KVCacheGroupSpec(
+                name="test",
+                layer_indices=(0,),
+                spec=KVCacheSpec(block_size=block_size, page_size_bytes=1),
+                max_blocks_per_seq=max_blocks_per_seq,
+                num_blocks=num_blocks,
+            ),
+        ),
+        max_batch_size=4,
+    )
+    scheduler_config = {
+        "max_num_running_reqs": 4,
+        "max_num_scheduled_tokens": 4,
+        "long_prefill_token_threshold": 2,
+        "max_prefill_tokens_per_request": 2,
+        "max_seq_len": 16,
+        "enable_prefix_cache": False,
+    }
+    scheduler_config.update(config)
+    return Scheduler(SchedulerConfig(**scheduler_config), manager)
+
+
+def _scheduled_phase(output):
+    assert output.scheduled_requests
+    phases = {item.is_prefill for item in output.scheduled_requests}
+    assert len(phases) == 1
+    return "prefill" if phases.pop() else "decode"
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_grouped_cache_round_robins_prefill_and_decode_steps(async_scheduling):
+    scheduler = _grouped_scheduler(async_scheduling=async_scheduling)
+    prefill = Request(
+        request_id="prefill",
+        prompt_token_ids=list(range(6)),
+        max_new_tokens=1,
+        status=RequestStatus.RUNNING,
+    )
+    decode = _running_decode_request(req_id="decode")
+    scheduler.running = [prefill, decode]
+    scheduler.requests = {request.request_id: request for request in scheduler.running}
+
+    phases = []
+    prefill_offsets = []
+    decode_offsets = []
+    pending = []
+    for token_id in range(4):
+        output = scheduler.schedule()
+        phase = _scheduled_phase(output)
+        phases.append(phase)
+        offsets = [item.num_computed_tokens for item in output.scheduled_requests]
+        if phase == "prefill":
+            prefill_offsets.extend(offsets)
+        else:
+            decode_offsets.extend(offsets)
+        if async_scheduling:
+            scheduler.advance_after_schedule(output)
+        pending.append((output, {} if phase == "prefill" else {"decode": [200 + token_id]}))
+        if not async_scheduling or len(pending) == 2:
+            for pending_output, tokens in pending:
+                scheduler.update_from_output(pending_output, tokens)
+            pending.clear()
+
+    assert phases == ["decode", "prefill", "decode", "prefill"]
+    assert prefill_offsets == [0, 2]
+    assert decode_offsets == [2, 3]
+    assert decode.num_output_placeholders == 0
+
+
+@pytest.mark.parametrize("terminal_barrier", [False, True])
+def test_grouped_cache_waiting_prefill_gets_a_fair_phase(terminal_barrier):
+    scheduler = _grouped_scheduler(
+        async_scheduling=terminal_barrier,
+        num_speculative_tokens=int(terminal_barrier),
+    )
+    running = (
+        Request(
+            request_id="terminal",
+            prompt_token_ids=[1, 2],
+            max_new_tokens=4,
+            num_computed_tokens=2,
+            num_output_placeholders=1,
+            terminal_prefill_in_flight=True,
+            status=RequestStatus.RUNNING,
+        )
+        if terminal_barrier
+        else _running_decode_request(req_id="decode")
+    )
+    scheduler.running.append(running)
+    scheduler.requests[running.request_id] = running
+    prefill = Request("prefill", list(range(6)), max_new_tokens=1)
+    scheduler.add_request(prefill)
+
+    steps = [scheduler.schedule()]
+    if not terminal_barrier:
+        scheduler.update_from_output(steps[0], {"decode": [200]})
+        steps.append(scheduler.schedule())
+    prefill_step = steps[-1]
+
+    expected_phases = ["prefill"] if terminal_barrier else ["decode", "prefill"]
+    assert [_scheduled_phase(step) for step in steps] == expected_phases
+    assert [item.request.request_id for item in prefill_step.scheduled_requests] == ["prefill"]
+    assert not scheduler.waiting
+    assert prefill in scheduler.running
+
+
+def test_grouped_cache_empty_prefill_attempt_does_not_starve_decode():
+    scheduler = _grouped_scheduler(
+        num_blocks=1,
+        block_size=4,
+        max_blocks_per_seq=1,
+        max_seq_len=4,
+    )
+    decode = Request(
+        request_id="decode",
+        prompt_token_ids=[1],
+        max_new_tokens=4,
+        num_computed_tokens=1,
+        output_token_ids=[9],
+        status=RequestStatus.RUNNING,
+    )
+    scheduler.running.append(decode)
+    scheduler.requests[decode.request_id] = decode
+    scheduler.add_request(Request("prefill", [3, 4], max_new_tokens=1))
+
+    first_decode = scheduler.schedule()
+    scheduler.update_from_output(first_decode, {"decode": [10]})
+    blocked_prefill = scheduler.schedule()
+    second_decode = scheduler.schedule()
+
+    assert _scheduled_phase(first_decode) == "decode"
+    assert blocked_prefill.is_empty
+    assert _scheduled_phase(second_decode) == "decode"
+
+
+def test_grouped_cache_does_not_readmit_an_async_preemption_in_the_same_step():
+    scheduler = _grouped_scheduler(
+        num_blocks=3,
+        max_blocks_per_seq=3,
+        async_scheduling=True,
+    )
+    prefill = Request("prefill", [1], max_new_tokens=1, status=RequestStatus.RUNNING)
+    decode = _running_decode_request(req_id="decode")
+    scheduler.running = [prefill, decode]
+    scheduler.requests = {request.request_id: request for request in scheduler.running}
+
+    decode_step = scheduler.schedule()
+    scheduler.advance_after_schedule(decode_step)
+    prefill_step = scheduler.schedule()
+    scheduler.advance_after_schedule(prefill_step)
+
+    assert [item.request.request_id for item in decode_step.scheduled_requests] == ["decode"]
+    assert [item.request.request_id for item in prefill_step.scheduled_requests] == ["prefill"]
+    assert [request.request_id for request in prefill_step.preempted_requests] == ["decode"]
+    assert decode.status is RequestStatus.PREEMPTED
+    assert [request.request_id for request in scheduler.waiting] == ["decode"]
+
+    scheduler.update_from_output(decode_step, {"decode": [10]})
+    assert decode.output_token_ids == [99]
+
+    scheduler.update_from_output(prefill_step, {"prefill": [20]})
+    restarted = scheduler.schedule()
+    assert [item.request.request_id for item in restarted.scheduled_requests] == ["decode"]
+    assert restarted.scheduled_requests[0].is_prefill
+    assert restarted.scheduled_requests[0].num_computed_tokens == 0
+
+
 def _scheduled_tuple(item):
     return item.request.request_id, item.num_computed_tokens, item.num_new_tokens
 
