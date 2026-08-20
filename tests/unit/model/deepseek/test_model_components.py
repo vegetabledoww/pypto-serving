@@ -1801,6 +1801,35 @@ def _prefill_batch(
     )
 
 
+@pytest.mark.parametrize(
+    ("updates", "error"),
+    [
+        ({field: []}, rf"prefill {field} has 0 entries for 2 requests")
+        for field in ("seq_lens", "chunk_lens", "chunk_offsets", "chunk_starts")
+    ]
+    + [
+        ({"chunk_lens": [0, 2]}, r"chunk_lens\[0\] must be positive"),
+        ({"chunk_lens": [-1, 2]}, r"chunk_lens\[0\] must be positive"),
+        ({"seq_lens": [-1, 2]}, r"seq_lens\[0\] must be non-negative"),
+        ({"seq_lens": [1, 2], "chunk_starts": [-1, 0]}, r"chunk_starts\[0\] must be non-negative"),
+        ({"seq_lens": [3, 2]}, r"seq_lens\[0\]=3 must equal chunk_starts\[0\]=0"),
+        ({"chunk_offsets": [1, 2]}, r"chunk_offsets\[0\]=1.*packed token offset 0"),
+        ({"chunk_offsets": [0, 1]}, r"chunk_offsets\[1\]=1.*packed token offset 2"),
+        ({"chunk_offsets": [0, 3]}, r"chunk_offsets\[1\]=3.*packed token offset 2"),
+        ({"token_ids": torch.arange(4).reshape(2, 2)}, r"token_ids must be 1-D packed"),
+        ({"token_ids": torch.arange(3)}, r"token_ids contains 3 packed tokens, expected 4"),
+        ({"input_embeddings": torch.zeros(4)}, r"input_embeddings must have shape \[tokens, hidden\]"),
+        ({"input_embeddings": torch.zeros(3, 4)}, r"input_embeddings contains 3 packed rows, expected 4"),
+    ],
+)
+def test_deepseek_prepare_prefill_inputs_rejects_inconsistent_packed_metadata(updates, error):
+    runner, model = _runner_for_prepared_inputs()
+    batch = _prefill_batch([2, 2])
+
+    with pytest.raises(ValueError, match=error):
+        runner.prepare_prefill_inputs(model, replace(batch, **updates))
+
+
 def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     runner, model = _runner_for_prepared_inputs()
     model = replace(model, runtime=replace(model.runtime, max_seq_len=129))

@@ -1414,9 +1414,79 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             n_routed_experts=self._compiled.n_routed_experts,
         )
 
+    @staticmethod
+    def _validate_prefill_batch_metadata(batch: PrefillBatch, request_count: int) -> None:
+        """Validate the packed-token metadata consumed by DeepSeek prefill."""
+        metadata = (
+            ("seq_lens", batch.seq_lens),
+            ("chunk_lens", batch.chunk_lens),
+            ("chunk_offsets", batch.chunk_offsets),
+            ("chunk_starts", batch.chunk_starts),
+        )
+        for name, values in metadata:
+            if len(values) != request_count:
+                raise ValueError(
+                    f"DeepSeekV4 prefill {name} has {len(values)} entries for "
+                    f"{request_count} requests"
+                )
+
+        packed_tokens = 0
+        for index in range(request_count):
+            seq_len = int(batch.seq_lens[index])
+            chunk_len = int(batch.chunk_lens[index])
+            chunk_offset = int(batch.chunk_offsets[index])
+            chunk_start = int(batch.chunk_starts[index])
+            if chunk_len <= 0:
+                raise ValueError(
+                    f"DeepSeekV4 prefill chunk_lens[{index}] must be positive, got {chunk_len}"
+                )
+            if seq_len < 0:
+                raise ValueError(
+                    f"DeepSeekV4 prefill seq_lens[{index}] must be non-negative, got {seq_len}"
+                )
+            if chunk_start < 0:
+                raise ValueError(
+                    f"DeepSeekV4 prefill chunk_starts[{index}] must be non-negative, got {chunk_start}"
+                )
+            expected_seq_len = chunk_start + chunk_len
+            if seq_len != expected_seq_len:
+                raise ValueError(
+                    f"DeepSeekV4 prefill seq_lens[{index}]={seq_len} must equal "
+                    f"chunk_starts[{index}]={chunk_start} + chunk_lens[{index}]={chunk_len}"
+                )
+            if chunk_offset != packed_tokens:
+                raise ValueError(
+                    f"DeepSeekV4 prefill chunk_offsets[{index}]={chunk_offset} must equal "
+                    f"packed token offset {packed_tokens}"
+                )
+            packed_tokens += chunk_len
+
+        if batch.token_ids.ndim != 1:
+            raise ValueError(
+                "DeepSeekV4 prefill token_ids must be 1-D packed, "
+                f"got shape={tuple(batch.token_ids.shape)}"
+            )
+        token_extent = int(batch.token_ids.shape[0])
+        if token_extent != packed_tokens:
+            raise ValueError(
+                f"DeepSeekV4 prefill token_ids contains {token_extent} packed tokens, "
+                f"expected {packed_tokens} from chunk_lens"
+            )
+        if batch.input_embeddings is not None:
+            if batch.input_embeddings.ndim != 2:
+                raise ValueError(
+                    "DeepSeekV4 prefill input_embeddings must have shape [tokens, hidden], "
+                    f"got shape={tuple(batch.input_embeddings.shape)}"
+                )
+            embedding_extent = int(batch.input_embeddings.shape[0])
+            if embedding_extent != packed_tokens:
+                raise ValueError(
+                    f"DeepSeekV4 prefill input_embeddings contains {embedding_extent} packed rows, "
+                    f"expected {packed_tokens} from chunk_lens"
+                )
+
     def prepare_prefill_inputs(self, model: RuntimeModel, batch: PrefillBatch) -> DeepSeekV4PreparedPrefillInputs:
         """Build DeepSeekV4 prefill host inputs for the current scheduler chunk."""
-        builder = self._require_input_builder()
         layout = self._compiled.layout
         request_count = len(batch.request_ids)
         if request_count <= 0 or request_count > layout.ranks * layout.prefill_batch:
@@ -1424,6 +1494,8 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 "DeepSeekV4 prefill supports one local request per rank and "
                 f"at most {layout.ranks} global requests, got {request_count}"
             )
+        self._validate_prefill_batch_metadata(batch, request_count)
+        builder = self._require_input_builder()
         if len(batch.cache_partitions) != request_count:
             raise ValueError("DeepSeekV4 prefill requires one cache partition per request")
         ranks = tuple(int(rank) for rank in batch.cache_partitions)
