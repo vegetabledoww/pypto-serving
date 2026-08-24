@@ -14,6 +14,7 @@ import importlib
 import os
 import sys
 from collections.abc import Iterable, Sequence
+from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -30,6 +31,7 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4CompiledKernels,
     DeepSeekV4L3Callable,
     DeepSeekV4ModelRunner,
+    DeepSeekV4ServingContract,
     build_deepseek_v4_layer_plan,
     deepseek_v4_decode_layout,
 )
@@ -41,6 +43,7 @@ from pypto_serving.tools.profile import profile_span
 
 _DEEPSEEK_V4_KERNEL_DIRNAME = "deepseek_v4_flash_mtp"
 _DEEPSEEK_V4_IMPORT_MODULES = (
+    "serving_contract",
     "config",
     "moe",
     "combine",
@@ -119,6 +122,79 @@ def _is_deepseek_v4_module_file(path: Path, kernel_dir: Path) -> bool:
     )
 
 
+@lru_cache(maxsize=None)
+def _load_deepseek_v4_serving_contract_file(
+    module_path: Path,
+) -> DeepSeekV4ServingContract:
+    """Load and validate one resolved pypto-lib capability manifest."""
+    if not module_path.is_file():
+        raise FileNotFoundError(
+            f"DeepSeekV4 serving contract not found at {module_path}"
+        )
+    module_name = (
+        "_pypto_lib_deepseek_v4_serving_contract_"
+        f"{abs(hash(str(module_path.resolve())))}"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load DeepSeekV4 serving contract from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    contract = getattr(module, "DEEPSEEK_V4_FLASH_SERVING_CONTRACT", None)
+    if contract is None:
+        raise TypeError(
+            "DeepSeekV4 serving contract does not define "
+            "DEEPSEEK_V4_FLASH_SERVING_CONTRACT"
+        )
+    if getattr(contract, "schema_version", None) != "1":
+        raise ValueError(
+            "Unsupported DeepSeekV4 serving contract schema: "
+            f"{getattr(contract, 'schema_version', None)!r}"
+        )
+    integer_fields = (
+        "prefill_tile_tokens",
+        "max_prefill_tokens_per_request",
+        "max_prefill_requests_per_partition",
+    )
+    for name in integer_fields:
+        value = getattr(contract, name, None)
+        if type(value) is not int or value <= 0:
+            raise TypeError(
+                f"DeepSeekV4 serving contract {name} must be a positive int"
+            )
+    homogeneous = getattr(contract, "requires_homogeneous_prefill_decode", None)
+    if type(homogeneous) is not bool:
+        raise TypeError(
+            "DeepSeekV4 serving contract requires_homogeneous_prefill_decode "
+            "must be a bool"
+        )
+    pad_tokens = getattr(contract, "padded_prefill_tokens", None)
+    if not callable(pad_tokens):
+        raise TypeError(
+            "DeepSeekV4 serving contract padded_prefill_tokens must be callable"
+        )
+    tile = contract.prefill_tile_tokens
+    maximum = contract.max_prefill_tokens_per_request
+    if maximum % tile or pad_tokens(1) != tile or pad_tokens(maximum) != maximum:
+        raise ValueError("DeepSeekV4 serving contract has inconsistent prefill limits")
+    return contract
+
+
+def load_deepseek_v4_serving_contract(
+    pypto_lib_root: str | None = None,
+) -> DeepSeekV4ServingContract:
+    """Load the side-effect-free serving contract owned by pypto-lib."""
+    kernel_dir = _find_pypto_lib_deepseek_v4_dir(pypto_lib_root)
+    return _load_deepseek_v4_serving_contract_file(
+        (kernel_dir / "serving_contract.py").resolve()
+    )
+
+
 @contextlib.contextmanager
 def _deepseek_v4_import_context(
     kernel_dir: Path,
@@ -191,6 +267,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             use_compile_cache=use_compile_cache,
         )
         self._kernel_dir = _find_pypto_lib_deepseek_v4_dir()
+        self._kernel_contract = load_deepseek_v4_serving_contract()
         self._compile_kernels = bool(compile_kernels)
         self._num_speculative_tokens = int(num_speculative_tokens)
         if self._num_speculative_tokens < 0:
@@ -213,7 +290,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
     @property
     def max_prefill_batch_size(self) -> int:
         """Return the global DP width: one local prefill request per EP rank."""
-        return DeepSeekV4CacheLayout().ranks
+        return (
+            DeepSeekV4CacheLayout().ranks
+            * self._kernel_contract.max_prefill_requests_per_partition
+        )
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -295,6 +375,21 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         # a 16-token specialization and the smallest power-of-two request-local
         # sequence that can cover one target-verification chunk.
         layout = deepseek_v4_decode_layout(self._num_speculative_tokens)
+        if layout.prefill_seq != int(self._kernel_contract.prefill_tile_tokens):
+            raise ValueError(
+                "DeepSeekV4 serving/kernel prefill tile mismatch: "
+                f"layout={layout.prefill_seq}, "
+                f"kernel={self._kernel_contract.prefill_tile_tokens}"
+            )
+        if (
+            layout.prefill_batch
+            != self._kernel_contract.max_prefill_requests_per_partition
+        ):
+            raise ValueError(
+                "DeepSeekV4 serving/kernel prefill partition width mismatch: "
+                f"layout={layout.prefill_batch}, "
+                f"kernel={self._kernel_contract.max_prefill_requests_per_partition}"
+            )
         layout.validate_runtime(model.config, model.runtime, self._device_ids)
         compress_ratios = tuple(int(ratio) for ratio in metadata["compress_ratios"])
         if len(compress_ratios) != model.config.num_hidden_layers + 1:
@@ -381,6 +476,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             compress_ratios=compress_ratios,
             layer_plan=layer_plan,
             kernel_dir=str(self._kernel_dir),
+            kernel_contract=self._kernel_contract,
             runtime_model=model,
             prefill=prefill,
             decode=decode,

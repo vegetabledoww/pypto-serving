@@ -14,7 +14,7 @@ import math
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from pypto_serving.model.common.runner.task_args import TaskArgs
@@ -54,6 +54,20 @@ from pypto_serving.tools.profile import profile_span
 logger = logging.getLogger(__name__)
 
 
+class DeepSeekV4ServingContract(Protocol):
+    """Serving-visible constraints exported by the pypto-lib kernels."""
+
+    schema_version: str
+    prefill_tile_tokens: int
+    max_prefill_tokens_per_request: int
+    max_prefill_requests_per_partition: int
+    requires_homogeneous_prefill_decode: bool
+
+    def padded_prefill_tokens(self, active_tokens: int) -> int:
+        """Return the kernel extent for one active prefill request."""
+        ...
+
+
 DEEPSEEK_V4_RANKS = 8
 DEEPSEEK_V4_HC_MULT = 4
 DEEPSEEK_V4_VOCAB_SIZE = 129280
@@ -74,7 +88,6 @@ DEEPSEEK_V4_PREFILL_SEQ = 128
 # used by vLLM's SlidingWindowSpec.
 DEEPSEEK_V4_MAX_IN_FLIGHT_PREFILL_TOKENS = 2 * DEEPSEEK_V4_PREFILL_SEQ
 DEEPSEEK_V4_MAX_SEQ_LEN = 16384
-DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS = 8192
 # Prefill and decode share scheduler-owned rank-local physical pools. Group
 # block IDs are local to each DP rank and address worker-resident cache shards.
 DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS = 128
@@ -778,6 +791,7 @@ class DeepSeekV4CompiledKernels:
     compress_ratios: tuple[int, ...]
     layer_plan: tuple["DeepSeekV4LayerPlan", ...]
     kernel_dir: str
+    kernel_contract: DeepSeekV4ServingContract
     prepacked_layer_weights: DeepSeekV4StackedLayerWeights | None = None
     runtime_model: RuntimeModel | None = None
     prefill: DeepSeekV4L3Callable | None = None
@@ -4685,7 +4699,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
 
     def _prefill_active_token_limit(self, runtime: RuntimeConfig | None) -> int:
         """Return the configured active-token limit for one main-prefill call."""
-        limits = [DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS]
+        limits = [int(self._compiled.kernel_contract.max_prefill_tokens_per_request)]
         if runtime is not None:
             limits.append(int(runtime.max_num_batched_tokens))
             limits.append(int(runtime.max_seq_len))
@@ -4720,14 +4734,7 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
                 f"DeepSeekV4 {mode} prefill received {actual_tokens} active tokens; "
                 f"the configured single-request limit is {active_limit}"
             )
-        tile_tokens = self._compiled.layout.prefill_seq
-        kernel_tokens = ((int(actual_tokens) + tile_tokens - 1) // tile_tokens) * tile_tokens
-        if kernel_tokens > DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS:
-            raise ValueError(
-                f"DeepSeekV4 main prefill kernel supports at most "
-                f"{DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS} rows, got {kernel_tokens}"
-            )
-        return kernel_tokens
+        return int(self._compiled.kernel_contract.padded_prefill_tokens(actual_tokens))
 
     @staticmethod
     def _prefill_kernel_positions(

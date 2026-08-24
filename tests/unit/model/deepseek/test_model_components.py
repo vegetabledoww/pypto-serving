@@ -31,7 +31,6 @@ from pypto_serving.model.deepseek import npu_executor, weight_loader
 from pypto_serving.model.deepseek import task_args as task_args_module
 from pypto_serving.model.deepseek.npu_runner import (
     DEEPSEEK_V4_LM_HEAD_TP_SIZE,
-    DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
     DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS,
     DeepSeekV4CacheLayout,
     DeepSeekV4CacheMetadataBuilder,
@@ -72,6 +71,31 @@ from pypto_serving.model.deepseek.weight_loader import (
 )
 from pypto_serving.model.model_loader import ModelLoader
 from pypto_serving.tools import prepack_deepseek_v4
+
+
+def _deepseek_serving_contract(
+    *,
+    prefill_tile_tokens: int = 128,
+    max_prefill_tokens_per_request: int | None = None,
+):
+    if max_prefill_tokens_per_request is None:
+        max_prefill_tokens_per_request = 64 * prefill_tile_tokens
+
+    def padded_prefill_tokens(active_tokens: int) -> int:
+        if active_tokens <= 0 or active_tokens > max_prefill_tokens_per_request:
+            raise ValueError("invalid active prefill extent")
+        return (
+            (active_tokens + prefill_tile_tokens - 1) // prefill_tile_tokens
+        ) * prefill_tile_tokens
+
+    return SimpleNamespace(
+        schema_version="1",
+        prefill_tile_tokens=prefill_tile_tokens,
+        max_prefill_tokens_per_request=max_prefill_tokens_per_request,
+        max_prefill_requests_per_partition=1,
+        requires_homogeneous_prefill_decode=True,
+        padded_prefill_tokens=padded_prefill_tokens,
+    )
 
 
 class _CountingPagedOriMetadata:
@@ -697,6 +721,7 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.runtime_config.num_speculative_tokens == 4
     assert config.runtime_config.max_prefill_tokens_per_request == 8192
     assert config.runtime_config.supports_chunked_prefill_with_speculation is True
+    assert config.runtime_config.requires_homogeneous_prefill_decode is True
     assert config.max_num_running_reqs == 16
     assert config.executor_kwargs["use_compile_cache"] is True
 
@@ -733,7 +758,11 @@ def test_cli_keeps_deepseek_autoregressive_decode_when_mtp_is_disabled(tmp_path)
     config = cli.build_serving_engine_config(args)
 
     assert config.executor_kwargs["num_speculative_tokens"] == 0
-    assert config.runtime_config.max_prefill_tokens_per_request == DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
+    contract = npu_executor.load_deepseek_v4_serving_contract()
+    assert (
+        config.runtime_config.max_prefill_tokens_per_request
+        == contract.max_prefill_tokens_per_request
+    )
 
 
 @pytest.mark.parametrize(
@@ -1245,6 +1274,7 @@ def test_deepseek_executor_lazily_loads_and_caches_embeddings(tmp_path):
                 num_hash_layers=3,
             ),
             kernel_dir=str(tmp_path),
+            kernel_contract=_deepseek_serving_contract(),
         )
     }
     executor._embedding_cache = {}
@@ -1629,6 +1659,7 @@ def test_deepseek_cache_sizing_uses_limiting_rank_post_weight_budget(monkeypatch
             compress_ratios=tuple([0] * 43),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
             device_id=2,
             device_ids=(2, 5),
         )
@@ -1661,6 +1692,7 @@ def test_deepseek_cache_allocation_halves_all_groups_together_on_oom(monkeypatch
             compress_ratios=tuple([0] * 43),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
         )
     )
     runner._cache_group_specs = _deepseek_cache_group_specs(4096, runner._compiled.compress_ratios)
@@ -1702,6 +1734,7 @@ def test_deepseek_device_cache_allocates_runtime_sized_rank_shards():
             compress_ratios=tuple([0] * 43),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
         )
     )
     runner._cache_group_num_blocks = {
@@ -1908,7 +1941,9 @@ def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
             model.runtime,
             max_seq_len=8193,
             max_num_batched_tokens=8192,
-            max_prefill_tokens_per_request=DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
+            max_prefill_tokens_per_request=(
+                runner._compiled.kernel_contract.max_prefill_tokens_per_request
+            ),
         ),
     )
     grouped_rows = _grouped_cache_rows(1)
@@ -1961,7 +1996,9 @@ def test_deepseek_prepare_prefill_inputs_pads_mixed_ranks_to_one_dynamic_extent(
             model.runtime,
             max_seq_len=1024,
             max_num_batched_tokens=512,
-            max_prefill_tokens_per_request=DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
+            max_prefill_tokens_per_request=(
+                runner._compiled.kernel_contract.max_prefill_tokens_per_request
+            ),
         ),
     )
     chunk_lens = [129, 257]
@@ -2251,6 +2288,7 @@ def _mtp_prefill_capture_harness(
             compress_ratios=(),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
         )
     )
     calls = []
@@ -2766,6 +2804,7 @@ def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
             compress_ratios=(),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
             mtp_prefill=DeepSeekV4L3Callable(compiled=object(), name="mtp_prefill"),
             mtp_decode=DeepSeekV4L3Callable(compiled=object(), name="mtp_decode"),
         )
@@ -2798,6 +2837,7 @@ def test_deepseek_mtp_prefill_outputs_allocate_empty_rank_shards_once():
             compress_ratios=(),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
         )
     )
 
@@ -2860,6 +2900,7 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
             compress_ratios=(),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
         )
     )
 
@@ -2941,6 +2982,7 @@ def test_deepseek_mtp_prefill_args_use_device_outputs():
             compress_ratios=(),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
         )
     )
 
@@ -3086,6 +3128,27 @@ def _write_deepseek_kernel_dir(
     (kernel_dir / "decode_fwd.py").write_text("")
     (kernel_dir / "decode_fwd_mtp.py").write_text("")
     (kernel_dir / "decode_mtp.py").write_text("")
+    (kernel_dir / "serving_contract.py").write_text(
+        "\n".join(
+            [
+                "class _Contract:",
+                "    schema_version = '1'",
+                "    prefill_tile_tokens = 128",
+                "    max_prefill_tokens_per_request = 8192",
+                "    max_prefill_requests_per_partition = 1",
+                "    requires_homogeneous_prefill_decode = True",
+                "",
+                "    @staticmethod",
+                "    def padded_prefill_tokens(active_tokens):",
+                "        if active_tokens <= 0 or active_tokens > 8192:",
+                "            raise ValueError('invalid active prefill extent')",
+                "        return ((active_tokens + 127) // 128) * 128",
+                "",
+                "DEEPSEEK_V4_FLASH_SERVING_CONTRACT = _Contract()",
+                "",
+            ]
+        )
+    )
     (kernel_dir / "config.py").write_text(
         "\n".join(
             [
@@ -3238,6 +3301,7 @@ def _runner_for_prepared_inputs(
             num_hash_layers=3,
         ),
         kernel_dir="",
+        kernel_contract=_deepseek_serving_contract(),
         num_speculative_tokens=num_speculative_tokens,
         embedding_weight=torch.arange(128 * 4, dtype=torch.float32)
         .reshape(128, 4)
@@ -3261,6 +3325,7 @@ def test_deepseek_static_lm_head_weight_replicates_one_vocab_shard_per_dp_rank()
         compress_ratios=(),
         layer_plan=(),
         kernel_dir="",
+        kernel_contract=_deepseek_serving_contract(prefill_tile_tokens=layout.prefill_seq),
     )
     runner = DeepSeekV4ModelRunner(compiled=compiled)
     vocab_per_rank = 2
@@ -3727,6 +3792,7 @@ def test_deepseek_fused_metadata_is_resident_per_ping_pong_slot_and_dirty_rank()
             compress_ratios=(),
             layer_plan=(),
             kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(),
             num_speculative_tokens=1,
         )
     )

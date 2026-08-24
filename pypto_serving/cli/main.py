@@ -302,13 +302,17 @@ def _build_runtime_config(
     kv_cache_groups = ()
     max_prefill_tokens_per_request = None
     supports_chunked_prefill_with_speculation = True
+    requires_homogeneous_prefill_decode = False
     if model_family == "deepseek_v4":
+        from pypto_serving.model.deepseek.npu_executor import (
+            load_deepseek_v4_serving_contract,
+        )
         from pypto_serving.model.deepseek.npu_runner import (
-            DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS,
             build_deepseek_v4_cache_group_specs,
             deepseek_v4_decode_layout,
         )
 
+        kernel_contract = load_deepseek_v4_serving_contract()
         config_data = config_data or {}
         compress_ratios = config_data.get("compress_ratios")
         if not isinstance(compress_ratios, list):
@@ -322,7 +326,12 @@ def _build_runtime_config(
             enable_mtp=num_speculative_tokens == 1,
             max_seq_len=args.max_model_len,
         )
-        max_prefill_tokens_per_request = DEEPSEEK_V4_MAIN_PREFILL_MAX_TOKENS
+        max_prefill_tokens_per_request = int(
+            kernel_contract.max_prefill_tokens_per_request
+        )
+        requires_homogeneous_prefill_decode = bool(
+            kernel_contract.requires_homogeneous_prefill_decode
+        )
 
     return RuntimeConfig(
         page_size=args.block_size,
@@ -335,6 +344,7 @@ def _build_runtime_config(
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
+        requires_homogeneous_prefill_decode=requires_homogeneous_prefill_decode,
         num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,
     )

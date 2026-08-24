@@ -51,6 +51,7 @@ class SchedulerConfig:
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
     supports_chunked_prefill_with_speculation: bool = True
+    requires_homogeneous_prefill_decode: bool = False
     # Async (pipelined) scheduling: schedule step N+1 before step N's sampled
     # token returns, advancing request state optimistically via placeholders.
     async_scheduling: bool = False
@@ -178,8 +179,8 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
-        # Grouped-cache kernels keep each external dispatch in one execution
-        # phase. Rotate the preferred phase across scheduler steps so a long
+        # Kernels with a homogeneous P/D contract keep each external dispatch
+        # in one phase. Rotate the preferred phase so a long
         # chunked prefill cannot starve already-ready decode work (and vice
         # versa). Decode goes first when both kinds of work initially coexist.
         self._next_grouped_cache_phase = "decode"
@@ -556,8 +557,8 @@ class Scheduler:
         return min(needed, limit)
 
     def _grouped_cache_phase(self) -> str | None:
-        """Choose one homogeneous grouped-cache phase and rotate fairly."""
-        if not self.kv_cache_manager.has_groups:
+        """Choose one homogeneous kernel phase and rotate fairly."""
+        if not self.config.requires_homogeneous_prefill_decode:
             return None
         has_running_prefill = any(
             request.status is not RequestStatus.PREEMPTED

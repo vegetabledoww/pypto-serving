@@ -197,6 +197,9 @@ class ReplicaEngineCore:
             supports_chunked_prefill_with_speculation=(
                 runtime.supports_chunked_prefill_with_speculation
             ),
+            requires_homogeneous_prefill_decode=(
+                runtime.requires_homogeneous_prefill_decode
+            ),
             async_scheduling=self._async_scheduling,
         )
         self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)

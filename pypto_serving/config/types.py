@@ -153,6 +153,9 @@ class RuntimeConfig:
     # Whether speculative decoding can safely consume a prompt produced by
     # more than one prefill dispatch.
     supports_chunked_prefill_with_speculation: bool = True
+    # Whether the kernel requires each scheduler step to contain prefill or
+    # decode work, never both.
+    requires_homogeneous_prefill_decode: bool = False
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
     # Extra cache positions and execution tokens reserved for speculative decode.

@@ -99,6 +99,7 @@ def _grouped_scheduler(
         "max_prefill_tokens_per_request": 2,
         "max_seq_len": 16,
         "enable_prefix_cache": False,
+        "requires_homogeneous_prefill_decode": True,
     }
     scheduler_config.update(config)
     return Scheduler(SchedulerConfig(**scheduler_config), manager)
@@ -149,6 +150,23 @@ def test_grouped_cache_round_robins_prefill_and_decode_steps(async_scheduling):
     assert prefill_offsets == [0, 2]
     assert decode_offsets == [2, 3]
     assert decode.num_output_placeholders == 0
+
+
+def test_grouped_cache_can_mix_phases_without_a_homogeneous_kernel_contract():
+    scheduler = _grouped_scheduler(requires_homogeneous_prefill_decode=False)
+    prefill = Request(
+        request_id="prefill",
+        prompt_token_ids=list(range(6)),
+        max_new_tokens=1,
+        status=RequestStatus.RUNNING,
+    )
+    decode = _running_decode_request(req_id="decode")
+    scheduler.running = [prefill, decode]
+    scheduler.requests = {request.request_id: request for request in scheduler.running}
+
+    output = scheduler.schedule()
+
+    assert {item.is_prefill for item in output.scheduled_requests} == {False, True}
 
 
 @pytest.mark.parametrize("terminal_barrier", [False, True])
@@ -217,19 +235,26 @@ def test_grouped_cache_empty_prefill_attempt_does_not_starve_decode():
     assert _scheduled_phase(second_decode) == "decode"
 
 
-def test_grouped_cache_does_not_readmit_an_async_preemption_in_the_same_step():
-    scheduler = _grouped_scheduler(
+def test_scheduler_does_not_readmit_an_async_preemption_in_the_same_step():
+    scheduler = _prefill_scheduler(
         num_blocks=3,
-        max_blocks_per_seq=3,
+        block_size=1,
+        max_num_running_reqs=4,
+        max_num_scheduled_tokens=4,
+        long_prefill_token_threshold=2,
+        max_prefill_tokens_per_request=2,
+        max_seq_len=16,
         async_scheduling=True,
     )
-    prefill = Request("prefill", [1], max_new_tokens=1, status=RequestStatus.RUNNING)
     decode = _running_decode_request(req_id="decode")
-    scheduler.running = [prefill, decode]
-    scheduler.requests = {request.request_id: request for request in scheduler.running}
+    scheduler.running = [decode]
+    scheduler.requests = {decode.request_id: decode}
 
     decode_step = scheduler.schedule()
     scheduler.advance_after_schedule(decode_step)
+    prefill = Request("prefill", [1], max_new_tokens=1, status=RequestStatus.RUNNING)
+    scheduler.running.insert(0, prefill)
+    scheduler.requests[prefill.request_id] = prefill
     prefill_step = scheduler.schedule()
     scheduler.advance_after_schedule(prefill_step)
 
