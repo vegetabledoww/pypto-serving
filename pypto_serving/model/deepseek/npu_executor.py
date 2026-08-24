@@ -289,11 +289,22 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
     @property
     def max_prefill_batch_size(self) -> int:
-        """Return the global DP width: one local prefill request per EP rank."""
+        """Return the global DP width of one packed prefill dispatch."""
         return (
             DeepSeekV4CacheLayout().ranks
-            * self._kernel_contract.max_prefill_requests_per_partition
+            * self.max_prefill_requests_per_partition
         )
+
+    @property
+    def max_prefill_requests_per_partition(self) -> int:
+        """Return the rank-local width supported by prefill and decode state."""
+        width = self._kernel_contract.max_prefill_requests_per_partition
+        if self._num_speculative_tokens:
+            width = min(
+                width,
+                deepseek_v4_decode_layout(self._num_speculative_tokens).decode_batch,
+            )
+        return width
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -374,7 +385,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         # Autoregressive decode keeps the established eight-token tile. MTP uses
         # a 16-token specialization and the smallest power-of-two request-local
         # sequence that can cover one target-verification chunk.
-        layout = deepseek_v4_decode_layout(self._num_speculative_tokens)
+        layout = deepseek_v4_decode_layout(
+            self._num_speculative_tokens,
+            prefill_batch=int(
+                self._kernel_contract.max_prefill_requests_per_partition
+            ),
+            prefill_seq=int(self._kernel_contract.prefill_tile_tokens),
+        )
         if layout.prefill_seq != int(self._kernel_contract.prefill_tile_tokens):
             raise ValueError(
                 "DeepSeekV4 serving/kernel prefill tile mismatch: "

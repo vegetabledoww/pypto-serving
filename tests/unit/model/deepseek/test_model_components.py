@@ -92,7 +92,7 @@ def _deepseek_serving_contract(
         schema_version="1",
         prefill_tile_tokens=prefill_tile_tokens,
         max_prefill_tokens_per_request=max_prefill_tokens_per_request,
-        max_prefill_requests_per_partition=1,
+        max_prefill_requests_per_partition=4,
         requires_homogeneous_prefill_decode=True,
         padded_prefill_tokens=padded_prefill_tokens,
     )
@@ -920,6 +920,7 @@ def test_deepseek_compile_selects_mtp_programs(
 
     def _fake_compile(self, name, jit_fn, *, layout, runtime_scalar_names=None):
         assert layout == deepseek_v4_decode_layout(num_speculative_tokens)
+        assert (layout.prefill_batch, layout.prefill_seq) == (4, 128)
         compile_calls.append((name, jit_fn, runtime_scalar_names))
         return DeepSeekV4L3Callable(compiled=object(), name=name)
 
@@ -1875,53 +1876,79 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
 
     assert prepared.request_ids == ("req-a",)
     assert prepared.ranks == (0,)
+    assert prepared.local_rows == (0,)
     assert prepared.actual_tokens == (3,)
     assert prepared.kernel_tokens == 128
-    assert prepared.x_hc.shape == (8, 128, 4, 4)
+    assert layout.prefill_batch == 4
+    assert prepared.x_hc.shape == (8, 4, 128, 4, 4)
     assert prepared.x_hc.dtype == torch.float32
-    assert prepared.ori_block_table.shape == (8, 128)
-    assert prepared.ori_block_table[0, :4].tolist() == [0, 0, 0, 0]
-    assert prepared.hca_cmp_block_table.shape == (layout.ranks, layout.prefill_cmp_max_blocks)
-    assert prepared.csa_cmp_block_table.shape == (layout.ranks, layout.prefill_cmp_max_blocks)
-    assert prepared.idx_block_table.shape == (layout.ranks, layout.prefill_idx_max_blocks)
-    assert prepared.position_ids.shape == (8, 128)
-    assert prepared.position_ids[0, :4].tolist() == [126, 127, 128, 128]
-    assert torch.all(prepared.position_ids[0] < model.runtime.max_seq_len)
-    assert prepared.input_ids[0, :4].tolist() == [10, 11, 12, 10]
-    assert prepared.ori_slot_mapping.shape == (8, 128)
-    assert prepared.ori_slot_mapping[0, :4].tolist() == [126, 127, 0, -1]
-    assert prepared.hca_cmp_slot_mapping.shape == (8, 128)
-    assert prepared.hca_cmp_slot_mapping[0, :3].tolist() == [-1, 1, -1]
-    assert prepared.hca_cmp_slot_mapping[0, 3].item() == -1
-    assert prepared.csa_cmp_slot_mapping.shape == (8, 128)
-    assert prepared.csa_cmp_slot_mapping[0, :3].tolist() == [-1, 63, -1]
-    assert prepared.csa_cmp_slot_mapping[0, 3].item() == -1
-    assert prepared.csa_idx_slot_mapping.shape == (8, 128)
-    assert prepared.csa_idx_slot_mapping[0, :3].tolist() == [-1, 95, -1]
-    assert prepared.csa_idx_slot_mapping[0, 3].item() == -1
-    assert prepared.hca_state_slot_mapping.shape == (8, 128)
-    assert prepared.hca_state_slot_mapping[0, :4].tolist() == [
+    assert prepared.ori_block_table.shape == (8, 4, 128)
+    assert prepared.ori_block_table[0, 0, :4].tolist() == [0, 0, 0, 0]
+    assert prepared.hca_cmp_block_table.shape == (
+        layout.ranks,
+        layout.prefill_batch,
+        layout.prefill_cmp_max_blocks,
+    )
+    assert prepared.csa_cmp_block_table.shape == (
+        layout.ranks,
+        layout.prefill_batch,
+        layout.prefill_cmp_max_blocks,
+    )
+    assert prepared.idx_block_table.shape == (
+        layout.ranks,
+        layout.prefill_batch,
+        layout.prefill_idx_max_blocks,
+    )
+    assert prepared.position_ids.shape == (8, 4, 128)
+    assert prepared.position_ids[0, 0, :4].tolist() == [126, 127, 128, 128]
+    assert torch.all(prepared.position_ids[0, 0] < model.runtime.max_seq_len)
+    assert prepared.input_ids[0, 0, :4].tolist() == [10, 11, 12, 10]
+    assert prepared.ori_slot_mapping.shape == (8, 4, 128)
+    assert prepared.ori_slot_mapping[0, 0, :4].tolist() == [126, 127, 0, -1]
+    assert prepared.hca_cmp_slot_mapping.shape == (8, 4, 128)
+    assert prepared.hca_cmp_slot_mapping[0, 0, :3].tolist() == [-1, 1, -1]
+    assert prepared.hca_cmp_slot_mapping[0, 0, 3].item() == -1
+    assert prepared.csa_cmp_slot_mapping.shape == (8, 4, 128)
+    assert prepared.csa_cmp_slot_mapping[0, 0, :3].tolist() == [-1, 63, -1]
+    assert prepared.csa_cmp_slot_mapping[0, 0, 3].item() == -1
+    assert prepared.csa_idx_slot_mapping.shape == (8, 4, 128)
+    assert prepared.csa_idx_slot_mapping[0, 0, :3].tolist() == [-1, 95, -1]
+    assert prepared.csa_idx_slot_mapping[0, 0, 3].item() == -1
+    assert prepared.hca_state_slot_mapping.shape == (8, 4, 128)
+    assert prepared.hca_state_slot_mapping[0, 0, :4].tolist() == [
         30,
         31,
         24,
         -1,
     ]
-    assert prepared.csa_state_slot_mapping.shape == (8, 128)
-    assert prepared.csa_state_slot_mapping[0, :4].tolist() == [
+    assert prepared.csa_state_slot_mapping.shape == (8, 4, 128)
+    assert prepared.csa_state_slot_mapping[0, 0, :4].tolist() == [
         18,
         19,
         16,
         -1,
     ]
-    assert prepared.csa_inner_state_slot_mapping.shape == (8, 128)
-    assert prepared.csa_inner_state_slot_mapping[0, :4].tolist() == [
+    assert prepared.csa_inner_state_slot_mapping.shape == (8, 4, 128)
+    assert prepared.csa_inner_state_slot_mapping[0, 0, :4].tolist() == [
         22,
         23,
         20,
         -1,
     ]
-    assert prepared.num_tokens_per_owner.tolist() == [3, 0, 0, 0, 0, 0, 0, 0]
-    assert prepared.logit_row_indices[0].tolist() == [2, -1, -1, -1, -1, -1, -1, -1]
+    assert prepared.num_tokens_per_owner.shape == (4, 8)
+    assert prepared.num_tokens_per_owner[0].tolist() == [3, 0, 0, 0, 0, 0, 0, 0]
+    assert prepared.num_tokens_per_owner[1:].eq(0).all()
+    assert prepared.logit_row_indices.shape == (8, 4, 8)
+    assert prepared.logit_row_indices[0, 0].tolist() == [
+        2,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1959,7 +1986,7 @@ def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
 
     assert prepared.actual_tokens == (actual_tokens,)
     assert prepared.kernel_tokens == kernel_tokens
-    assert prepared.x_hc.shape == (8, kernel_tokens, 4, 4)
+    assert prepared.x_hc.shape == (8, 4, kernel_tokens, 4, 4)
     row_tensors = (
         "input_ids",
         "position_ids",
@@ -1971,16 +1998,19 @@ def test_deepseek_prepare_prefill_inputs_uses_dynamic_main_extent(
         "csa_state_slot_mapping",
         "csa_inner_state_slot_mapping",
     )
-    assert all(getattr(prepared, name).shape == (8, kernel_tokens) for name in row_tensors)
-    assert prepared.logit_row_indices[0, 0].item() == actual_tokens - 1
+    assert all(
+        getattr(prepared, name).shape == (8, 4, kernel_tokens)
+        for name in row_tensors
+    )
+    assert prepared.logit_row_indices[0, 0, 0].item() == actual_tokens - 1
     if actual_tokens < kernel_tokens:
-        assert torch.all(prepared.ori_slot_mapping[0, actual_tokens:] == -1)
+        assert torch.all(prepared.ori_slot_mapping[0, 0, actual_tokens:] == -1)
     if actual_tokens == 8192:
-        assert prepared.hca_cmp_block_table[0, :64].tolist() == list(range(100, 164))
-        assert prepared.csa_cmp_block_table[0, :64].tolist() == list(range(200, 264))
-        assert prepared.csa_cmp_slot_mapping[0, 3].item() == 200 * 32
-        assert prepared.csa_cmp_slot_mapping[0, 4099].item() == 232 * 32
-        assert prepared.csa_cmp_slot_mapping[0, 8191].item() == 263 * 32 + 31
+        assert prepared.hca_cmp_block_table[0, 0, :64].tolist() == list(range(100, 164))
+        assert prepared.csa_cmp_block_table[0, 0, :64].tolist() == list(range(200, 264))
+        assert prepared.csa_cmp_slot_mapping[0, 0, 3].item() == 200 * 32
+        assert prepared.csa_cmp_slot_mapping[0, 0, 4099].item() == 232 * 32
+        assert prepared.csa_cmp_slot_mapping[0, 0, 8191].item() == 263 * 32 + 31
     if actual_tokens == 129:
         runner._compiled.runtime_model = replace(
             model, runtime=replace(model.runtime, max_num_batched_tokens=actual_tokens)
@@ -2018,12 +2048,80 @@ def test_deepseek_prepare_prefill_inputs_pads_mixed_ranks_to_one_dynamic_extent(
 
     assert prepared.actual_tokens == (129, 257)
     assert prepared.kernel_tokens == 384
-    assert prepared.x_hc.shape == (8, 384, 4, 4)
-    assert prepared.num_tokens_per_owner.tolist() == [0, 129, 0, 0, 0, 0, 257, 0]
-    assert prepared.logit_row_indices[1, 0].item() == 128
-    assert prepared.logit_row_indices[6, 0].item() == 256
-    assert torch.all(prepared.ori_slot_mapping[1, 129:] == -1)
-    assert torch.all(prepared.ori_slot_mapping[6, 257:] == -1)
+    assert prepared.local_rows == (0, 0)
+    assert prepared.x_hc.shape == (8, 4, 384, 4, 4)
+    assert prepared.num_tokens_per_owner[0].tolist() == [0, 129, 0, 0, 0, 0, 257, 0]
+    assert prepared.num_tokens_per_owner[1:].eq(0).all()
+    assert prepared.logit_row_indices[1, 0, 0].item() == 128
+    assert prepared.logit_row_indices[6, 0, 0].item() == 256
+    assert torch.all(prepared.ori_slot_mapping[1, 0, 129:] == -1)
+    assert torch.all(prepared.ori_slot_mapping[6, 0, 257:] == -1)
+
+
+def test_deepseek_prepare_prefill_inputs_maps_four_local_rows_on_one_rank():
+    runner, model = _runner_for_prepared_inputs()
+    chunk_lens = [1, 2, 3, 4]
+    prepared = runner.prepare_prefill_inputs(
+        model,
+        _prefill_batch(chunk_lens, cache_partitions=[2] * len(chunk_lens)),
+    )
+
+    assert prepared.ranks == (2, 2, 2, 2)
+    assert prepared.local_rows == (0, 1, 2, 3)
+    assert prepared.num_tokens_per_owner[:, 2].tolist() == chunk_lens
+    assert prepared.num_tokens_per_owner[:, :2].eq(0).all()
+    assert prepared.num_tokens_per_owner[:, 3:].eq(0).all()
+    for local_row, (offset, length) in enumerate(
+        zip((0, 1, 3, 6), chunk_lens, strict=True)
+    ):
+        assert prepared.input_ids[2, local_row, :length].tolist() == list(
+            range(offset, offset + length)
+        )
+        assert prepared.ori_slot_mapping[2, local_row, :length].tolist() == list(
+            range(local_row * 128, local_row * 128 + length)
+        )
+        assert prepared.logit_row_indices[2, local_row, 0].item() == length - 1
+
+
+def test_deepseek_run_prefill_gathers_logits_by_rank_and_local_row():
+    runner = DeepSeekV4ModelRunner.__new__(DeepSeekV4ModelRunner)
+    runner._compiled = SimpleNamespace(prefill=object())
+    inputs = SimpleNamespace(
+        request_ids=("a", "b", "c", "d"),
+        ranks=(2, 2, 2, 2),
+        local_rows=(0, 1, 2, 3),
+        actual_tokens=(1, 1, 1, 1),
+        kernel_tokens=128,
+    )
+    logits = torch.zeros((8, 4, 1, 3), dtype=torch.float32)
+    for local_row in range(4):
+        logits[2, local_row, 0] = torch.tensor(
+            [local_row * 10 + 1, local_row * 10 + 2, local_row * 10 + 3]
+        )
+    runner._prefill_task_args = SimpleNamespace(
+        tensors={
+            "pre_hc_hidden_out": torch.empty(0),
+            "logits": logits,
+        },
+        clear_outputs=lambda: None,
+    )
+    runner._wait_for_pending_mtp_dispatches = lambda: None
+    runner._ensure_l3_shared_buffers = lambda _model: None
+    runner.prepare_prefill_inputs = lambda _model, _batch: inputs
+    runner._stage_prefill_fwd_inputs = lambda _inputs: None
+    runner._prefill_fwd_args = lambda _kernel_tokens: ()
+    runner._require_prefill_callable = lambda: object()
+    runner._run_l3 = lambda *_args: None
+    runner._prefill_completion = lambda _inputs, _buffer: None
+
+    result = runner.run_prefill(None, object())
+
+    assert result.logits.tolist() == [
+        [1.0, 2.0, 3.0],
+        [11.0, 12.0, 13.0],
+        [21.0, 22.0, 23.0],
+        [31.0, 32.0, 33.0],
+    ]
 
 def test_deepseek_prepare_decode_inputs_accepts_device_embedding_batch():
     runner, model = _runner_for_prepared_inputs()
@@ -2043,6 +2141,35 @@ def test_deepseek_prepare_decode_inputs_accepts_device_embedding_batch():
     assert prepared.input_ids[0, :2].tolist() == [5, 5]
     assert prepared.block_table is not None
     assert prepared.block_counts is not None
+
+
+def test_deepseek_async_ar_prepare_maps_multiple_local_rows_on_one_rank():
+    runner, model = _runner_for_prepared_inputs(
+        layout=deepseek_v4_decode_layout(0),
+        max_batch_size=4,
+    )
+    runner._cache_group_num_blocks = deepseek_v4_cache_blocks_for_slots(
+        runner._cache_group_specs,
+        4,
+    )
+
+    prepared = runner.prepare_decode_inputs(
+        model,
+        DecodeBatch(
+            request_ids=[f"req-{index}" for index in range(4)],
+            token_ids=torch.tensor([[5], [6], [7], [8]], dtype=torch.long),
+            hidden_states=None,
+            seq_lens=torch.tensor([128, 129, 130, 131], dtype=torch.int32),
+            block_ids_by_group=_grouped_cache_rows(4),
+            cache_partitions=[0, 0, 0, 0],
+        ),
+    )
+
+    assert prepared.ranks == (0, 0, 0, 0)
+    assert prepared.local_rows == (0, 1, 2, 3)
+    assert prepared.input_ids[0, :4].tolist() == [5, 6, 7, 8]
+    assert prepared.num_tokens_per_owner.tolist() == [4, 0, 0, 0, 0, 0, 0, 0]
+    assert prepared.logit_row_indices[0, :4].tolist() == [0, 1, 2, 3]
 
 
 def test_deepseek_prepare_mtp_target_inputs_limits_partial_chunk_rows():
@@ -2231,6 +2358,31 @@ def test_deepseek_first_decode_prepare_reserves_and_fully_binds_state():
     assert runner._decode_metadata_predecessor is pending.dispatch
 
 
+def test_deepseek_prefill_waits_for_both_pending_mtp_decode_slots():
+    runner, _model = _runner_for_prepared_inputs()
+    waits = []
+
+    class FakeDispatch:
+        def __init__(self, buffer_slot):
+            self.buffer_slot = buffer_slot
+
+        def wait(self):
+            waits.append(self.buffer_slot)
+
+    first = FakeDispatch(0)
+    second = FakeDispatch(1)
+    runner._track_pending_mtp_dispatch(0, first)
+    runner._track_pending_mtp_dispatch(1, second)
+
+    assert waits == []
+    assert runner._pending_mtp_dispatches == {0: first, 1: second}
+
+    runner._wait_for_pending_mtp_dispatches()
+
+    assert waits == [0, 1]
+    assert runner._pending_mtp_dispatches == {}
+
+
 def test_deepseek_prefill_context_preserves_prepare_reserved_state(monkeypatch):
     runner, _model = _runner_for_prepared_inputs()
     runner._compiled.num_speculative_tokens = 1
@@ -2243,18 +2395,45 @@ def test_deepseek_prefill_context_preserves_prepare_reserved_state(monkeypatch):
     inputs = SimpleNamespace(
         request_ids=("req-a",),
         ranks=(0,),
+        local_rows=(0,),
         actual_tokens=(tokens,),
-        x_hc=torch.zeros(layout.ranks, tokens, 1, hidden),
-        input_ids=torch.zeros(layout.ranks, tokens, dtype=torch.long),
-        position_ids=torch.zeros(layout.ranks, tokens, dtype=torch.int32),
-        ori_block_table=torch.zeros(layout.ranks, 1, dtype=torch.int32),
-        ori_slot_mapping=torch.zeros(layout.ranks, tokens, dtype=torch.int32),
+        x_hc=torch.zeros(layout.ranks, layout.prefill_batch, tokens, 1, hidden),
+        input_ids=torch.zeros(
+            layout.ranks,
+            layout.prefill_batch,
+            tokens,
+            dtype=torch.long,
+        ),
+        position_ids=torch.zeros(
+            layout.ranks,
+            layout.prefill_batch,
+            tokens,
+            dtype=torch.int32,
+        ),
+        ori_block_table=torch.zeros(
+            layout.ranks,
+            layout.prefill_batch,
+            1,
+            dtype=torch.int32,
+        ),
+        ori_slot_mapping=torch.zeros(
+            layout.ranks,
+            layout.prefill_batch,
+            tokens,
+            dtype=torch.int32,
+        ),
     )
     monkeypatch.setattr(runner, "_run_mtp_prefill_rows", lambda **_kwargs: None)
 
     runner._capture_mtp_prefill_context(
         inputs,
-        torch.zeros(layout.ranks, tokens, 1, hidden),
+        torch.zeros(
+            layout.ranks,
+            layout.prefill_batch,
+            tokens,
+            1,
+            hidden,
+        ),
     )
 
     assert runner._mtp_request_states["req-a"] is state
@@ -2314,26 +2493,65 @@ def _mtp_capture_inputs(
 ):
     # owner: (request_id, rank, actual_tokens, start, token_base, hidden_base)
     extent = kernel_tokens or max(owner[2] for owner in owners)
+    rank_counts = [0] * layout.ranks
+    local_rows = []
+    for owner in owners:
+        rank = owner[1]
+        local_rows.append(rank_counts[rank])
+        rank_counts[rank] += 1
     inputs = SimpleNamespace(
         request_ids=tuple(owner[0] for owner in owners),
         ranks=tuple(owner[1] for owner in owners),
+        local_rows=tuple(local_rows),
         actual_tokens=tuple(owner[2] for owner in owners),
-        x_hc=torch.zeros((layout.ranks, extent, 4, 1), dtype=torch.float32),
-        input_ids=torch.zeros((layout.ranks, extent), dtype=torch.long),
-        position_ids=torch.zeros((layout.ranks, extent), dtype=torch.int32),
-        ori_block_table=torch.zeros((layout.ranks, layout.prefill_ori_max_blocks), dtype=torch.int32),
-        ori_slot_mapping=torch.full((layout.ranks, extent), -1, dtype=torch.long),
+        x_hc=torch.zeros(
+            (layout.ranks, layout.prefill_batch, extent, 4, 1),
+            dtype=torch.float32,
+        ),
+        input_ids=torch.zeros(
+            (layout.ranks, layout.prefill_batch, extent),
+            dtype=torch.long,
+        ),
+        position_ids=torch.zeros(
+            (layout.ranks, layout.prefill_batch, extent),
+            dtype=torch.int32,
+        ),
+        ori_block_table=torch.zeros(
+            (
+                layout.ranks,
+                layout.prefill_batch,
+                layout.prefill_ori_max_blocks,
+            ),
+            dtype=torch.int32,
+        ),
+        ori_slot_mapping=torch.full(
+            (layout.ranks, layout.prefill_batch, extent),
+            -1,
+            dtype=torch.long,
+        ),
     )
-    pre_hc = torch.zeros((layout.ranks, layout.prefill_seq, 4, 1), dtype=torch.float32)
-    for _request_id, rank, actual_tokens, start, token_base, hidden_base in owners:
+    pre_hc = torch.zeros(
+        (layout.ranks, layout.prefill_batch, layout.prefill_seq, 4, 1),
+        dtype=torch.float32,
+    )
+    for (
+        _request_id,
+        rank,
+        actual_tokens,
+        start,
+        token_base,
+        hidden_base,
+    ), local_row in zip(owners, local_rows, strict=True):
         token_values = torch.arange(actual_tokens)
         positions = start + token_values
-        inputs.x_hc[rank, :actual_tokens, 0, 0] = token_base + token_values
-        inputs.input_ids[rank, :actual_tokens] = token_base + token_values
-        inputs.position_ids[rank, :actual_tokens] = positions
-        inputs.ori_slot_mapping[rank, :actual_tokens] = positions
+        inputs.x_hc[rank, local_row, :actual_tokens, 0, 0] = token_base + token_values
+        inputs.input_ids[rank, local_row, :actual_tokens] = token_base + token_values
+        inputs.position_ids[rank, local_row, :actual_tokens] = positions
+        inputs.ori_slot_mapping[rank, local_row, :actual_tokens] = positions
         tail_tokens = min(actual_tokens, layout.prefill_seq)
-        pre_hc[rank, :tail_tokens, 0, 0] = hidden_base + torch.arange(tail_tokens)
+        pre_hc[rank, local_row, :tail_tokens, 0, 0] = hidden_base + torch.arange(
+            tail_tokens
+        )
     return inputs, pre_hc
 
 
@@ -2740,7 +2958,7 @@ def test_deepseek_dynamic_prefill_views_reuse_pre_fork_shared_storage():
     )
     task_args = prefill_task_args(runner, hidden=1, vocab=1)
     task_args.allocate_host_shared(None)
-    assert task_args.tensors["x_hc"].shape == (2, 12, 1, 1)
+    assert task_args.tensors["x_hc"].shape == (2, 4, 12, 1, 1)
 
     task_args.tensors["hidden_out"].fill_(7)
     task_args.tensors["pre_hc_hidden_out"].fill_(7)
@@ -2755,9 +2973,20 @@ def test_deepseek_dynamic_prefill_views_reuse_pre_fork_shared_storage():
     values = {}
     for name in dynamic_inputs:
         target = task_args.tensors[name]
-        shape = (layout.ranks, kernel_tokens, *target.shape[2:])
-        values[name] = torch.arange(target[:, :kernel_tokens].numel(), dtype=target.dtype).reshape(shape)
-    values["ori_block_table"] = torch.tensor([[11], [22]], dtype=torch.int32)
+        shape = (
+            layout.ranks,
+            layout.prefill_batch,
+            kernel_tokens,
+            *target.shape[3:],
+        )
+        values[name] = torch.arange(
+            target[:, :, :kernel_tokens].numel(),
+            dtype=target.dtype,
+        ).reshape(shape)
+    values["ori_block_table"] = torch.tensor(
+        [[[11], [12], [13], [14]], [[21], [22], [23], [24]]],
+        dtype=torch.int32,
+    )
 
     task_args.stage_for_tokens(values, kernel_tokens)
 
@@ -2774,13 +3003,13 @@ def test_deepseek_dynamic_prefill_views_reuse_pre_fork_shared_storage():
 
     for name in dynamic_inputs | {"hidden_out"}:
         active = dispatch_values[name]
-        assert active.shape[1] == kernel_tokens
+        assert active.shape[2] == kernel_tokens
         assert active.is_shared() and active.is_contiguous()
         assert active.data_ptr() == task_args.tensors[name].data_ptr()
-    assert dispatch_values["x_hc"].shape == (2, 8, 1, 1)
-    assert dispatch_values["hidden_out"].shape == (2, 8, 1)
-    assert dispatch_values["pre_hc_hidden_out"].shape == (2, 4, 1, 1)
-    assert dispatch_values["logits"].shape == (2, 8, 1)
+    assert dispatch_values["x_hc"].shape == (2, 4, 8, 1, 1)
+    assert dispatch_values["hidden_out"].shape == (2, 4, 8, 1)
+    assert dispatch_values["pre_hc_hidden_out"].shape == (2, 4, 4, 1, 1)
+    assert dispatch_values["logits"].shape == (2, 4, 8, 1)
 
 
 def test_deepseek_mtp_prefill_and_decode_reuse_same_kv_cache():
@@ -3135,7 +3364,7 @@ def _write_deepseek_kernel_dir(
                 "    schema_version = '1'",
                 "    prefill_tile_tokens = 128",
                 "    max_prefill_tokens_per_request = 8192",
-                "    max_prefill_requests_per_partition = 1",
+                "    max_prefill_requests_per_partition = 4",
                 "    requires_homogeneous_prefill_decode = True",
                 "",
                 "    @staticmethod",
@@ -3286,11 +3515,18 @@ def _runtime_model_for_embeddings():
 def _runner_for_prepared_inputs(
     *,
     num_speculative_tokens: int = 0,
+    layout: DeepSeekV4CacheLayout | None = None,
+    max_batch_size: int = 1,
 ) -> tuple[DeepSeekV4ModelRunner, object]:
     model = _runtime_model_for_embeddings()
+    model = replace(
+        model,
+        runtime=replace(model.runtime, max_batch_size=max_batch_size),
+    )
     compiled = DeepSeekV4CompiledKernels(
         # Exercise the production MTP tile while keeping the tiny host-side model.
-        layout=DeepSeekV4CacheLayout(decode_batch=4, decode_seq=2, decode_tokens=8),
+        layout=layout
+        or DeepSeekV4CacheLayout(decode_batch=4, decode_seq=2, decode_tokens=8),
         model_dir="",
         weight_map={},
         weight_store=None,
@@ -3616,8 +3852,20 @@ def test_deepseek_prefill_task_args_classifies_kinds_and_builds():
     ta.allocate_host_shared(None)
 
     layout = runner._compiled.layout
-    assert tuple(ta.tensors["x_hc"].shape)[1:] == (layout.prefill_seq, layout.hc_mult, 4096)
-    assert ta.tensors["logits"].shape[1] == DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS
+    assert tuple(ta.tensors["x_hc"].shape)[1:] == (
+        layout.prefill_batch,
+        layout.prefill_seq,
+        layout.hc_mult,
+        4096,
+    )
+    assert ta.tensors["num_tokens_per_owner"].shape == (
+        layout.prefill_batch,
+        layout.ranks,
+    )
+    assert ta.tensors["logits"].shape[1:3] == (
+        layout.prefill_batch,
+        DEEPSEEK_V4_PREFILL_MAX_LOGIT_ROWS,
+    )
     assert ta.tensors["input_ids"].dtype == torch.int64
 
     built = ta.build()

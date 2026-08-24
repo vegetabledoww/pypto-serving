@@ -92,6 +92,30 @@ def test_partitioned_prefill_chunks_keep_cache_partitions_unique():
     ]
 
 
+def test_partitioned_prefill_chunks_fill_four_local_rows_before_splitting():
+    requests = [
+        PrefillRequest(
+            request_id=f"req-{index}",
+            chunk_tokens=[1],
+            num_computed_tokens=0,
+            block_ids=[],
+            cache_partition=3,
+        )
+        for index in range(5)
+    ]
+
+    chunks = WorkerProcess._partitioned_prefill_chunks(
+        requests,
+        max_batch=32,
+        max_per_partition=4,
+    )
+
+    assert [[request.request_id for request in chunk] for chunk in chunks] == [
+        ["req-0", "req-1", "req-2", "req-3"],
+        ["req-4"],
+    ]
+
+
 def test_worker_releases_preempted_state_before_same_command_reregistration():
     released: list[str] = []
     results: list[bytes] = []
