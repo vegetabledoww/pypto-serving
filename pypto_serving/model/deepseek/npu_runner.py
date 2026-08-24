@@ -2465,7 +2465,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         ):
             self._stage_prefill_fwd_inputs(inputs)
             self._prefill_task_args.clear_outputs()
-            args = self._prefill_fwd_args(inputs.kernel_tokens)
+            active_local_slots = max(inputs.local_rows) + 1
+            if set(inputs.local_rows) != set(range(active_local_slots)):
+                raise RuntimeError(
+                    "DeepSeekV4 packed prefill local rows must form a contiguous prefix"
+                )
+            args = self._prefill_fwd_args(
+                inputs.kernel_tokens,
+                active_local_slots,
+            )
             pre_hc_hidden_buffer = self._prefill_task_args.tensors["pre_hc_hidden_out"]
             logits_buffer = self._prefill_task_args.tensors["logits"]
         try:
@@ -3315,13 +3323,26 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             self._materialize_resident_weights()
         self._l3_shared_buffers_ready = True
 
-    def _prefill_fwd_args(self, kernel_tokens: int) -> tuple[Any, ...]:
+    def _prefill_fwd_args(
+        self,
+        kernel_tokens: int,
+        active_local_slots: int,
+    ) -> tuple[Any, ...]:
         """Build the single packed ``l3_prefill_fwd`` argument tuple.
 
         The kernel runs final RMSNorm and the device-side LM-head. Every positional
         arg is declared on ``_prefill_task_args`` (see ``deepseek/task_args.py``).
         """
-        return self._prefill_task_args.build_for_tokens(kernel_tokens)
+        active_local_slots = int(active_local_slots)
+        if not 0 < active_local_slots <= self._compiled.layout.prefill_batch:
+            raise ValueError(
+                "DeepSeekV4 active local prefill slots must be in "
+                f"[1, {self._compiled.layout.prefill_batch}], got {active_local_slots}"
+            )
+        return (
+            *self._prefill_task_args.build_for_tokens(kernel_tokens),
+            self._int32_scalar(active_local_slots),
+        )
 
     def _decode_fwd_args(self, inputs: DeepSeekV4PreparedDecodeInputs) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple from the decode TaskArgs.

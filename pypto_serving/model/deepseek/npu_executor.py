@@ -451,6 +451,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "deepseek_v4_prefill",
                 modules["prefill_fwd"].l3_prefill_fwd,
                 layout=layout,
+                runtime_scalar_names=frozenset({"active_local_slots"}),
             )
             use_fused_mtp = self._num_speculative_tokens == 1
             decode = self._compile_l3_callable(

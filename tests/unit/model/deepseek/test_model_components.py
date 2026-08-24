@@ -956,7 +956,11 @@ def test_deepseek_compile_selects_mtp_programs(
     compiled = executor._compile_model(loaded.runtime_model)
 
     expected_calls = [
-        ("deepseek_v4_prefill", prefill_fwd.l3_prefill_fwd, None),
+        (
+            "deepseek_v4_prefill",
+            prefill_fwd.l3_prefill_fwd,
+            frozenset({"active_local_slots"}),
+        ),
     ]
     if num_speculative_tokens == 1:
         expected_calls.append(
@@ -2109,13 +2113,17 @@ def test_deepseek_run_prefill_gathers_logits_by_rank_and_local_row():
     runner._ensure_l3_shared_buffers = lambda _model: None
     runner.prepare_prefill_inputs = lambda _model, _batch: inputs
     runner._stage_prefill_fwd_inputs = lambda _inputs: None
-    runner._prefill_fwd_args = lambda _kernel_tokens: ()
+    prefill_arg_calls = []
+    runner._prefill_fwd_args = lambda kernel_tokens, active_local_slots: (
+        prefill_arg_calls.append((kernel_tokens, active_local_slots)) or ()
+    )
     runner._require_prefill_callable = lambda: object()
     runner._run_l3 = lambda *_args: None
     runner._prefill_completion = lambda _inputs, _buffer: None
 
     result = runner.run_prefill(None, object())
 
+    assert prefill_arg_calls == [(128, 4)]
     assert result.logits.tolist() == [
         [1.0, 2.0, 3.0],
         [11.0, 12.0, 13.0],
