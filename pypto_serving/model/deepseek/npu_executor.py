@@ -382,9 +382,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 f"executor={self._num_speculative_tokens}, "
                 f"runtime={model.runtime.num_speculative_tokens}"
             )
-        # Autoregressive decode keeps the established eight-token tile. MTP uses
-        # a 16-token specialization and the smallest power-of-two request-local
-        # sequence that can cover one target-verification chunk.
+        # Decode keeps a fixed eight-token tile and uses the smallest
+        # power-of-two request-local sequence that can cover one target-
+        # verification chunk.
         layout = deepseek_v4_decode_layout(
             self._num_speculative_tokens,
             prefill_batch=int(

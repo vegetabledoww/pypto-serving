@@ -75,7 +75,7 @@ DEEPSEEK_V4_BLOCK_SIZE = 128
 DEEPSEEK_V4_DECODE_BATCH = 4
 DEEPSEEK_V4_DECODE_SEQ = 2
 DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
-DEEPSEEK_V4_MTP_DECODE_TOKENS = 16
+DEEPSEEK_V4_MTP_DECODE_TOKENS = DEEPSEEK_V4_DECODE_TOKENS
 DEEPSEEK_V4_PREFILL_BATCH = 4
 # The main prefill wrapper added by pypto-lib #893 accepts a dynamic request
 # extent and walks it in fixed 128-token tiles. The standalone MTP prefill
@@ -464,11 +464,10 @@ def deepseek_v4_decode_layout(
     prefill_batch: int = DEEPSEEK_V4_PREFILL_BATCH,
     prefill_seq: int = DEEPSEEK_V4_PREFILL_SEQ,
 ) -> DeepSeekV4CacheLayout:
-    """Select an aggressive 16-row decode tile for one MTP chunk.
+    """Select a fixed eight-row decode tile for one MTP chunk.
 
-    Autoregressive decode retains the established eight-row tile. MTP doubles
-    the per-rank tile to 16 rows and groups them into power-of-two request-local
-    sequences so target verification preserves twice the request capacity.
+    Decode groups the rows into power-of-two request-local sequences so target
+    verification preserves as much request capacity as the MTP depth permits.
     Draft depths larger than seven use repeated S=8 target chunks.
     """
     num_speculative_tokens = int(num_speculative_tokens)

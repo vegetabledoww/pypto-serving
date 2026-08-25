@@ -93,9 +93,9 @@ Each NPU runs one prefill row at a time, so DP=8 admits up to eight prefill
 requests in one global step. The vLLM-style `--speculative-config` selects
 `method="mtp"`; `num_speculative_tokens` is the maximum number of draft tokens,
 and any positive value enables MTP. The
-16-row MTP decode tile uses B8S2 for K=1, B4S4 for K=2-3, and B2S8 for
+fixed eight-row MTP decode tile uses B4S2 for K=1, B2S4 for K=2-3, and B1S8 for
 K>=4. K values larger than seven are supported through repeated target
-verification chunks. Set `--max-num-seqs` no higher than 64, 32, or 16,
+verification chunks. Set `--max-num-seqs` no higher than 32, 16, or 8,
 respectively. Non-MTP decode retains B8S1T8. The deprecated
 `--num-speculative-tokens K` and `--enable-mtp`
 flags remain compatibility aliases; `--enable-mtp` selects K=1.

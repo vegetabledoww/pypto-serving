@@ -570,9 +570,9 @@ def test_deepseek_mtp_partial_target_chunk_waves_requests_on_same_rank(monkeypat
 
 @pytest.mark.parametrize(
     ("num_speculative_tokens", "decode_seq", "decode_batch", "decode_tokens"),
-    [(0, 1, 8, 8), (1, 2, 8, 16), (2, 4, 4, 16), (3, 4, 4, 16), (4, 8, 2, 16), (32, 8, 2, 16)],
+    [(0, 1, 8, 8), (1, 2, 4, 8), (2, 4, 2, 8), (3, 4, 2, 8), (4, 8, 1, 8), (32, 8, 1, 8)],
 )
-def test_deepseek_mtp_depth_selects_expanded_decode_layout(
+def test_deepseek_mtp_depth_selects_fixed_eight_row_layout(
     num_speculative_tokens,
     decode_seq,
     decode_batch,
@@ -704,7 +704,7 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
             "--speculative-config",
             '{"method":"mtp","num_speculative_tokens":4}',
             "--max-num-seqs",
-            "16",
+            "8",
             "--use-compile-cache",
         ]
     )
@@ -722,7 +722,7 @@ def test_cli_selects_deepseek_executor_and_configures_mtp_depth(tmp_path):
     assert config.runtime_config.max_prefill_tokens_per_request == 8192
     assert config.runtime_config.supports_chunked_prefill_with_speculation is True
     assert config.runtime_config.requires_homogeneous_prefill_decode is True
-    assert config.max_num_running_reqs == 16
+    assert config.max_num_running_reqs == 8
     assert config.executor_kwargs["use_compile_cache"] is True
 
 
