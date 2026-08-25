@@ -3900,16 +3900,22 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
             raise RuntimeError("DeepSeekV4 MTP tail slot reservation is inconsistent")
         slot = state.tail_slot_id
         buffers = self._require_mtp_buffers()
-        staged = buffers.tail_init_hidden[rank, slot]
-        staged.copy_(hidden.to(dtype=torch.float32, device="cpu"))
+        host_shard = buffers.tail_init_hidden[rank]
+        staged = host_shard[slot]
         pool = self._materialize_mtp_tail_pre_hc_pool(int(staged.shape[-1]))
         shard = pool.shards[rank]
-        row_nbytes = staged.numel() * staged.element_size()
-        dst = shard.data_ptr + slot * row_nbytes
-        self._shared_l3_worker().copy_to(
-            dst,
-            staged.data_ptr(),
-            row_nbytes,
+        worker = self._shared_l3_worker()
+        worker.copy_from(
+            host_shard.data_ptr(),
+            shard.data_ptr,
+            shard.nbytes,
+            worker_id=rank,
+        )
+        staged.copy_(hidden.to(dtype=torch.float32, device="cpu"))
+        worker.copy_to(
+            shard.data_ptr,
+            host_shard.data_ptr(),
+            shard.nbytes,
             worker_id=rank,
         )
 
@@ -3928,10 +3934,27 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         buffers = self._require_mtp_buffers()
         rank = state.tail_rank
         slot = state.tail_slot_id
-        token_row = buffers.state_init_tokens[rank, slot]
+        worker = self._shared_l3_worker()
+        token_device = self._materialize_mtp_device_state_tokens()
+        meta_device = self._materialize_mtp_device_state_meta()
+        token_host_shard = buffers.state_init_tokens[rank]
+        meta_host_shard = buffers.state_init_meta[rank]
+        for device_tensor, host_shard in (
+            (token_device, token_host_shard),
+            (meta_device, meta_host_shard),
+        ):
+            shard = device_tensor.shards[rank]
+            worker.copy_from(
+                host_shard.data_ptr(),
+                shard.data_ptr,
+                shard.nbytes,
+                worker_id=rank,
+            )
+
+        token_row = token_host_shard[slot]
         token_row[0] = state.tail_token_id
         token_row[1] = state.draft_token_id
-        meta_row = buffers.state_init_meta[rank, slot]
+        meta_row = meta_host_shard[slot]
         meta_row.zero_()
         # Publish a completely initialized payload.  STATE_VALID is an
         # initialization guard; slot reuse safety comes from generation.
@@ -3939,17 +3962,15 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         meta_row[_MTP_STATE_GENERATION] = state.generation
         meta_row[_MTP_STATE_TAIL_POSITION] = state.tail_position
         meta_row[_MTP_STATE_COMMITTED_COUNT] = state.committed_count
-        worker = self._shared_l3_worker()
         for device_tensor, source in (
-            (self._materialize_mtp_device_state_tokens(), token_row),
-            (self._materialize_mtp_device_state_meta(), meta_row),
+            (token_device, token_host_shard),
+            (meta_device, meta_host_shard),
         ):
             shard = device_tensor.shards[rank]
-            row_nbytes = source.numel() * source.element_size()
             worker.copy_to(
-                shard.data_ptr + slot * row_nbytes,
+                shard.data_ptr,
                 source.data_ptr(),
-                row_nbytes,
+                shard.nbytes,
                 worker_id=rank,
             )
         state.device_state_initialized = True
@@ -4592,17 +4613,16 @@ class DeepSeekV4ModelRunner(L3DispatchMixin, ModelRunner):
         """Read one recurrent hidden row needed by arbitrary-depth MTP."""
         buffers = self._require_mtp_buffers()
         device_pre_hc = self._mtp_prefill_task_args.tensors["pre_hc_hidden_out"]
-        host_row = buffers.prefill_pre_hc_mirror[owner_rank, row]
+        host_shard = buffers.prefill_pre_hc_mirror[owner_rank]
         shard = device_pre_hc.shards[owner_rank]
         worker_id = device_pre_hc.worker_ids[owner_rank]
-        row_nbytes = host_row.numel() * host_row.element_size()
         self._shared_l3_worker().copy_from(
-            host_row.data_ptr(),
-            shard.data_ptr + row * row_nbytes,
-            row_nbytes,
+            host_shard.data_ptr(),
+            shard.data_ptr,
+            shard.nbytes,
             worker_id=worker_id,
         )
-        return host_row.detach().cpu().clone()
+        return host_shard[row].detach().cpu().clone()
 
     def _materialize_mtp_device_state_tokens(self) -> StackedDeviceTensor:
         """Allocate persistent tail/draft token slots on every rank."""

@@ -3123,7 +3123,7 @@ def test_deepseek_mtp_prefill_outputs_allocate_empty_rank_shards_once():
 def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
     layout = DeepSeekV4CacheLayout(
         ranks=2,
-        prefill_seq=1,
+        prefill_seq=3,
         decode_batch=1,
         decode_seq=1,
         decode_tokens=1,
@@ -3182,7 +3182,7 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
     runner._mtp_prefill_task_args = ta
 
     host_row = runner._read_mtp_prefill_logits(owner_rank=1)
-    host_pre_hc = runner._read_mtp_prefill_pre_hc(owner_rank=1, row=0)
+    host_pre_hc = runner._read_mtp_prefill_pre_hc(owner_rank=1, row=2)
 
     assert host_row.data_ptr() == runner._mtp_buffers.prefill_logits[1, 0].data_ptr()
     assert host_pre_hc.shape == (4, 5)
@@ -3194,12 +3194,108 @@ def test_deepseek_mtp_prefill_reads_only_selected_owner_outputs():
             1,
         ),
         (
-            runner._mtp_buffers.prefill_pre_hc_mirror[1, 0].data_ptr(),
+            runner._mtp_buffers.prefill_pre_hc_mirror[1].data_ptr(),
             ta.tensors["pre_hc_hidden_out"].shards[1].data_ptr,
-            4 * 5 * torch.float32.itemsize,
+            layout.prefill_seq * 4 * 5 * torch.float32.itemsize,
             1,
         ),
     ]
+
+
+def test_deepseek_mtp_state_initialization_copies_complete_rank_shards():
+    layout = DeepSeekV4CacheLayout(
+        ranks=2,
+        decode_batch=3,
+        decode_seq=1,
+        decode_tokens=1,
+    )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            kernel_contract=_deepseek_serving_contract(),
+            num_speculative_tokens=1,
+        )
+    )
+
+    class FakeWorker:
+        def __init__(self):
+            self.next_ptr = 0x10000000
+            self.copies = []
+
+        def alloc_tensor(self, shape, dtype, init=None, *, worker_id=0):
+            tensor = DeviceTensor(self.next_ptr, tuple(shape), dtype)
+            self.next_ptr += 0x1000000
+            return tensor
+
+        @staticmethod
+        def free_tensor(_tensor, *, worker_id=0):
+            pass
+
+        def copy_from(self, dst, src, nbytes, *, worker_id=0):
+            self.copies.append(("from", dst, src, nbytes, worker_id))
+
+        def copy_to(self, dst, src, nbytes, *, worker_id=0):
+            self.copies.append(("to", dst, src, nbytes, worker_id))
+
+    hidden = 5
+    worker = FakeWorker()
+    runner._l3_worker = worker
+    runner._mtp_buffers = SimpleNamespace(
+        tail_init_hidden=torch.zeros(
+            (layout.ranks, layout.decode_batch, layout.hc_mult, hidden),
+            dtype=torch.float32,
+        ).share_memory_(),
+        state_init_tokens=torch.zeros(
+            (layout.ranks, layout.decode_batch, 2),
+            dtype=torch.long,
+        ).share_memory_(),
+        state_init_meta=torch.zeros(
+            (layout.ranks, layout.decode_batch, 4),
+            dtype=torch.int32,
+        ).share_memory_(),
+    )
+    state = SimpleNamespace(
+        tail_rank=1,
+        tail_slot_id=2,
+        tail_token_id=17,
+        draft_token_id=23,
+        tail_position=8191,
+        generation=7,
+        committed_count=0,
+        device_state_initialized=False,
+    )
+
+    runner._write_mtp_tail_hidden(
+        state,
+        1,
+        torch.full((layout.hc_mult, hidden), 3.0),
+    )
+    runner._initialize_mtp_device_state(state)
+
+    tail = runner._mtp_tail_pre_hc_pool.shards[1]
+    tokens = runner._mtp_device_state_tokens.shards[1]
+    meta = runner._mtp_device_state_meta.shards[1]
+    host_tail = runner._mtp_buffers.tail_init_hidden[1]
+    host_tokens = runner._mtp_buffers.state_init_tokens[1]
+    host_meta = runner._mtp_buffers.state_init_meta[1]
+    assert worker.copies == [
+        ("from", host_tail.data_ptr(), tail.data_ptr, tail.nbytes, 1),
+        ("to", tail.data_ptr, host_tail.data_ptr(), tail.nbytes, 1),
+        ("from", host_tokens.data_ptr(), tokens.data_ptr, tokens.nbytes, 1),
+        ("from", host_meta.data_ptr(), meta.data_ptr, meta.nbytes, 1),
+        ("to", tokens.data_ptr, host_tokens.data_ptr(), tokens.nbytes, 1),
+        ("to", meta.data_ptr, host_meta.data_ptr(), meta.nbytes, 1),
+    ]
+    assert host_tail[2].eq(3.0).all()
+    assert host_tokens[2].tolist() == [17, 23]
+    assert host_meta[2].tolist() == [1, 7, 8191, 0]
+    assert state.device_state_initialized
 
 
 def test_deepseek_mtp_prefill_args_use_device_outputs():
