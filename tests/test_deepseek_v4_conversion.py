@@ -69,6 +69,33 @@ def test_fp8_dequantization_rejects_other_one_byte_dtypes():
         convert._dequantize_hybrid_weight(weight, scale)
 
 
+def test_load_e8m0_scale_decodes_exponents(tmp_path):
+    header = {
+        "w.scale": {"dtype": "F8_E8M0", "shape": [2, 2], "data_offsets": [0, 4]}
+    }
+    encoded_header = json.dumps(header).encode()
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(
+        len(encoded_header).to_bytes(8, "little")
+        + encoded_header
+        + bytes([127, 128, 126, 129])
+    )
+
+    actual = convert._load_e8m0_scale(checkpoint, "w.scale")
+
+    assert torch.equal(actual, torch.tensor([[1.0, 2.0], [0.5, 4.0]]))
+
+
+def test_load_e8m0_scale_rejects_nan(tmp_path):
+    header = {"w.scale": {"dtype": "F8_E8M0", "shape": [1], "data_offsets": [0, 1]}}
+    encoded_header = json.dumps(header).encode()
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(len(encoded_header).to_bytes(8, "little") + encoded_header + b"\xff")
+
+    with pytest.raises(ValueError, match="contains NaN"):
+        convert._load_e8m0_scale(checkpoint, "w.scale")
+
+
 def test_serving_quantization_is_symmetric_per_output_channel():
     weight = torch.tensor([[0.0, 1.0, -2.0], [0.5, -0.5, 0.25]], dtype=torch.float32)
 
@@ -87,6 +114,55 @@ def test_quantized_weight_selection_matches_deepseek_v4_serving_contract():
     assert convert._is_serving_quantized_weight("mtp.0.e_proj.weight", ratios)
     assert not convert._is_serving_quantized_weight("layers.3.attn.indexer.wq_b.weight", ratios)
     assert not convert._is_serving_quantized_weight("layers.0.attn.wq_a.weight", ratios)
+
+
+def test_quantized_weight_selection_includes_all_dspark_draft_layers():
+    ratios = [0, 0, 4, 128]
+
+    assert convert._is_serving_quantized_weight(
+        "mtp.2.ffn.experts.17.w2.weight", ratios, mtp_layer_count=3
+    )
+    assert convert._is_serving_quantized_weight(
+        "mtp.1.attn.wq_b.weight", ratios, mtp_layer_count=3
+    )
+    assert not convert._is_serving_quantized_weight(
+        "mtp.3.attn.wq_b.weight", ratios, mtp_layer_count=3
+    )
+    assert not convert._is_serving_quantized_weight(
+        "mtp.2.main_proj.weight", ratios, mtp_layer_count=3
+    )
+
+
+def test_mtp_layer_count_uses_dspark_target_layers():
+    assert convert._mtp_layer_count({"num_hidden_layers": 43}) == 1
+    assert (
+        convert._mtp_layer_count(
+            {"num_hidden_layers": 43, "dspark_target_layer_ids": [40, 41, 42]}
+        )
+        == 3
+    )
+
+
+@pytest.mark.parametrize(
+    "target_layer_ids",
+    [[], [40, 40], [-1], [43], ["40"]],
+)
+def test_mtp_layer_count_rejects_invalid_dspark_target_layers(target_layer_ids):
+    with pytest.raises(ValueError, match="invalid dspark_target_layer_ids"):
+        convert._mtp_layer_count(
+            {"num_hidden_layers": 43, "dspark_target_layer_ids": target_layer_ids}
+        )
+
+
+def test_dspark_quantization_metadata_ignores_bf16_projections():
+    ignore = convert._quantization_ignore(43, [0] * 43, mtp_layer_count=3)
+
+    assert "mtp.1.attn.wq_a" in ignore
+    assert "mtp.2.attn.wkv" in ignore
+    assert "mtp.0.main_proj" in ignore
+    assert "mtp.2.markov_head.markov_w1" in ignore
+    assert "mtp.2.markov_head.markov_w2" in ignore
+    assert "mtp.2.confidence_head.proj" in ignore
 
 
 def test_output_weight_map_only_adds_scales_available_in_the_source():
@@ -113,6 +189,33 @@ def test_source_validation_rejects_a_selected_weight_without_scale(tmp_path):
     _write_source_metadata(tmp_path, {weight_name: shard_name})
 
     with pytest.raises(ValueError, match="missing source scale for serving-quantized weight"):
+        convert._validate_source(tmp_path)
+
+
+def test_source_validation_rejects_a_missing_dspark_layer(tmp_path):
+    weight_name = "mtp.0.attn.wq_b.weight"
+    scale_name = "mtp.0.attn.wq_b.scale"
+    shard_name = "model-1.safetensors"
+    _write_source_metadata(
+        tmp_path, {weight_name: shard_name, scale_name: shard_name}
+    )
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["dspark_target_layer_ids"] = [0, 0]
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="invalid dspark_target_layer_ids"):
+        convert._validate_source(tmp_path)
+
+    config["dspark_target_layer_ids"] = [0]
+    config["num_hidden_layers"] = 2
+    config["compress_ratios"] = [0, 0]
+    config_path.write_text(json.dumps(config))
+    convert._validate_source(tmp_path)
+
+    config["dspark_target_layer_ids"] = [0, 1]
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="missing configured MTP/DSpark layer: mtp.1"):
         convert._validate_source(tmp_path)
 
 
