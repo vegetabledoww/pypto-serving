@@ -19,6 +19,10 @@ serving quantization is applied.
 
 The conversion is shard-by-shard and can be resumed. Existing output shards
 are never overwritten.
+
+Pass ``--no-spec-compatible`` to write the ``num_hidden_layers + 1``
+``compress_ratios`` contract required by current PyPTO serving when MTP is
+disabled. All configured MTP/DSpark draft weights are still converted.
 """
 
 from __future__ import annotations
@@ -67,6 +71,46 @@ _MTP_QUANT_RE = re.compile(
     r"ffn\.experts\.\d+\.w[123]|"
     r"(?:e_proj|h_proj)"
     r")\.weight$"
+)
+
+_DSPARK_COMMON_TENSOR_SUFFIXES = (
+    "attn.attn_sink",
+    "attn.q_norm.weight",
+    "attn.kv_norm.weight",
+    "attn_norm.weight",
+    "ffn_norm.weight",
+    "ffn.gate.weight",
+    "ffn.gate.bias",
+    "hc_attn_base",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+)
+_DSPARK_SCALED_MODULE_SUFFIXES = (
+    "attn.wq_a",
+    "attn.wq_b",
+    "attn.wkv",
+    "attn.wo_a",
+    "attn.wo_b",
+    "ffn.shared_experts.w1",
+    "ffn.shared_experts.w2",
+    "ffn.shared_experts.w3",
+)
+_DSPARK_FIRST_LAYER_TENSOR_SUFFIXES = (
+    "main_norm.weight",
+    "main_proj.weight",
+    "main_proj.scale",
+)
+_DSPARK_FINAL_LAYER_TENSOR_SUFFIXES = (
+    "confidence_head.proj.weight",
+    "markov_head.markov_w1.weight",
+    "markov_head.markov_w2.weight",
+    "norm.weight",
+    "hc_head_base",
+    "hc_head_fn",
+    "hc_head_scale",
 )
 
 _MXFP4_VALUES = torch.tensor(
@@ -129,6 +173,27 @@ def _mtp_layer_count(config: Mapping[str, object]) -> int:
     return len(target_layer_ids)
 
 
+def _required_dspark_tensor_names(
+    mtp_layer_count: int, n_routed_experts: int
+) -> set[str]:
+    required: set[str] = set()
+    for layer_id in range(mtp_layer_count):
+        prefix = f"mtp.{layer_id}"
+        suffixes = set(_DSPARK_COMMON_TENSOR_SUFFIXES)
+        for module_suffix in _DSPARK_SCALED_MODULE_SUFFIXES:
+            suffixes.update((f"{module_suffix}.weight", f"{module_suffix}.scale"))
+        for expert_id in range(n_routed_experts):
+            for weight_id in (1, 2, 3):
+                module_suffix = f"ffn.experts.{expert_id}.w{weight_id}"
+                suffixes.update((f"{module_suffix}.weight", f"{module_suffix}.scale"))
+        if layer_id == 0:
+            suffixes.update(_DSPARK_FIRST_LAYER_TENSOR_SUFFIXES)
+        if layer_id == mtp_layer_count - 1:
+            suffixes.update(_DSPARK_FINAL_LAYER_TENSOR_SUFFIXES)
+        required.update(f"{prefix}.{suffix}" for suffix in suffixes)
+    return required
+
+
 def _validate_source(input_dir: Path) -> tuple[dict, dict[str, str]]:
     config = _read_json(input_dir / "config.json")
     model_type = str(config.get("model_type", "")).lower()
@@ -145,9 +210,17 @@ def _validate_source(input_dir: Path) -> tuple[dict, dict[str, str]]:
 
     num_layers = int(config.get("num_hidden_layers", 0))
     compress_ratios = config.get("compress_ratios")
-    if num_layers <= 0 or not isinstance(compress_ratios, list) or len(compress_ratios) < num_layers:
+    if num_layers <= 0 or not isinstance(compress_ratios, list):
         raise ValueError("config.json has an invalid num_hidden_layers/compress_ratios contract")
-    if int(config.get("n_routed_experts", 0)) <= 0:
+    mtp_layer_count = _mtp_layer_count(config)
+    expected_ratio_count = num_layers + mtp_layer_count
+    if len(compress_ratios) != expected_ratio_count:
+        raise ValueError(
+            "config.json compress_ratios must include one entry per hidden layer and "
+            f"MTP/DSpark layer: expected {expected_ratio_count}, got {len(compress_ratios)}"
+        )
+    n_routed_experts = int(config.get("n_routed_experts", 0))
+    if n_routed_experts <= 0:
         raise ValueError("config.json has an invalid n_routed_experts value")
 
     index = _read_json(input_dir / "model.safetensors.index.json")
@@ -161,20 +234,18 @@ def _validate_source(input_dir: Path) -> tuple[dict, dict[str, str]]:
     if missing_shards:
         raise ValueError(f"missing source shard: {shard_paths[missing_shards[0]]}")
     compress_ratios = tuple(int(value) for value in compress_ratios)
-    mtp_layer_count = _mtp_layer_count(config)
-    missing_mtp_layers = (
-        [
-            layer_id
-            for layer_id in range(mtp_layer_count)
-            if f"mtp.{layer_id}.attn.wq_b.weight" not in normalized_map
-        ]
+    missing_dspark_tensors = (
+        sorted(
+            _required_dspark_tensor_names(mtp_layer_count, n_routed_experts)
+            - normalized_map.keys()
+        )
         if config.get("dspark_target_layer_ids") is not None
         else []
     )
-    if missing_mtp_layers:
+    if missing_dspark_tensors:
         raise ValueError(
-            "checkpoint is missing configured MTP/DSpark layer: "
-            f"mtp.{missing_mtp_layers[0]}"
+            "checkpoint is missing required MTP/DSpark tensor: "
+            f"{missing_dspark_tensors[0]}"
         )
     missing_scales = sorted(
         name
@@ -372,6 +443,26 @@ def _serving_quantization_config(
         "kv_cache_scheme": None,
         "li_cache_scheme": {"type": "int", "num_bits": 8},
     }
+
+
+def _build_output_config(
+    config: Mapping[str, object],
+    compress_ratios: Sequence[int],
+    mtp_layer_count: int,
+    *,
+    no_spec_compatible: bool,
+) -> dict:
+    num_layers = int(config["num_hidden_layers"])
+    output_ratios = tuple(int(value) for value in compress_ratios)
+    if no_spec_compatible:
+        output_ratios = output_ratios[: num_layers + 1]
+
+    output_config = dict(config)
+    output_config["compress_ratios"] = list(output_ratios)
+    output_config["quantization_config"] = _serving_quantization_config(
+        num_layers, compress_ratios, mtp_layer_count
+    )
+    return output_config
 
 
 def _load_scale(
@@ -677,7 +768,14 @@ def _validate_conversion_marker(
     return marker
 
 
-def convert_checkpoint(input_dir: Path, output_dir: Path, *, resume: bool, dry_run: bool) -> None:
+def convert_checkpoint(
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    resume: bool,
+    dry_run: bool,
+    no_spec_compatible: bool = False,
+) -> None:
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
     if input_dir == output_dir:
@@ -687,6 +785,12 @@ def convert_checkpoint(input_dir: Path, output_dir: Path, *, resume: bool, dry_r
     num_layers = int(config["num_hidden_layers"])
     compress_ratios = tuple(int(value) for value in config["compress_ratios"])
     mtp_layer_count = _mtp_layer_count(config)
+    output_config = _build_output_config(
+        config,
+        compress_ratios,
+        mtp_layer_count,
+        no_spec_compatible=no_spec_compatible,
+    )
     output_map = _build_output_weight_map(source_map, compress_ratios, mtp_layer_count)
     shard_names = sorted(set(source_map.values()))
     _require_safetensors()
@@ -709,6 +813,7 @@ def convert_checkpoint(input_dir: Path, output_dir: Path, *, resume: bool, dry_r
     print(f"Output: {output_dir}")
     print(f"Shards: {len(shard_names)}")
     print(f"MTP/DSpark layers: {mtp_layer_count}")
+    print(f"Output compress ratios: {len(output_config['compress_ratios'])}")
     print(f"Serving INT8 weights: {selected_count}")
     print(f"BF16 fallback weights: {dequantized_count}")
     if dry_run:
@@ -738,10 +843,6 @@ def convert_checkpoint(input_dir: Path, output_dir: Path, *, resume: bool, dry_r
             input_dir, output_dir, filename, source_map, compress_ratios, mtp_layer_count
         )
 
-    output_config = dict(config)
-    output_config["quantization_config"] = _serving_quantization_config(
-        num_layers, compress_ratios, mtp_layer_count
-    )
     (output_dir / "config.json").write_text(json.dumps(output_config, indent=2) + "\n")
     total_size = sum(
         _safetensors_total_size(_safe_shard_path(output_dir, filename)) for filename in shard_names
@@ -777,13 +878,27 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="validate the source and print the conversion plan without writing files",
     )
+    parser.add_argument(
+        "--no-spec-compatible",
+        action="store_true",
+        help=(
+            "write the current serving config contract for use with --no-enable-mtp; "
+            "all configured MTP/DSpark weights are still converted"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        convert_checkpoint(args.input_dir, args.output_dir, resume=args.resume, dry_run=args.dry_run)
+        convert_checkpoint(
+            args.input_dir,
+            args.output_dir,
+            resume=args.resume,
+            dry_run=args.dry_run,
+            no_spec_compatible=args.no_spec_compatible,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
