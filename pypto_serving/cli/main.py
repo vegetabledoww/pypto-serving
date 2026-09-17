@@ -730,8 +730,7 @@ def _validate_dspark_topology(args: argparse.Namespace) -> None:
     if args.max_model_len > DSPARK_MAX_SEQ_LEN:
         raise ValueError(
             "DSpark decode cache tables currently support at most "
-            f"--max-model-len {DSPARK_MAX_SEQ_LEN}. Extending the decode tables is "
-            "tracked by pypto-lib#905."
+            f"--max-model-len {DSPARK_MAX_SEQ_LEN}."
         )
 
 

@@ -300,8 +300,13 @@ class Scheduler:
                 continue
 
             is_prefill = request.is_prefill
+            # _limit_scheduled_tokens bounded num_new by the remaining context;
+            # after the positive check above, this remainder cannot be negative.
             speculative_tokens = (
-                self.config.num_speculative_tokens
+                min(
+                    self.config.num_speculative_tokens,
+                    self.config.max_seq_len - request.num_computed_tokens - num_new,
+                )
                 if not is_prefill and request.temperature <= 0.0
                 else 0
             )
@@ -567,7 +572,7 @@ class Scheduler:
                 limit = min(limit, chunk_limit)
             if self._requires_single_prefill_dispatch() and needed > limit:
                 return 0
-        return min(needed, limit)
+        return max(0, min(needed, limit, self.config.max_seq_len - request.num_computed_tokens))
 
     def _grouped_cache_phase(self) -> str | None:
         """Choose one homogeneous kernel phase and rotate fairly."""
@@ -676,7 +681,12 @@ class Scheduler:
         """
         if scheduled.is_prefill or request.temperature > 0.0:
             return 0
-        return self.config.num_speculative_tokens
+        # Use the dispatch snapshot: async advancement may already have changed
+        # the live request. Never reserve KV or placeholders beyond the ceiling.
+        return max(0, min(
+            self.config.num_speculative_tokens,
+            self.config.max_seq_len - scheduled.num_computed_tokens - scheduled.num_new_tokens,
+        ))
 
     def update_from_output(
         self,

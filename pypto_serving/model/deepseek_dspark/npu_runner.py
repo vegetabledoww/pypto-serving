@@ -27,6 +27,7 @@ TP4/DP4/EP16 topology:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -92,12 +93,20 @@ DSPARK_HCA_NUM_LAYERS = 20
 DSPARK_LM_HEAD_TP_SIZE = 4
 DSPARK_NOISE_TOKEN_ID = 128799
 
-# ---- ring heaps (sourced from the kernels' own runtime constants) ----
-# decode_fwd.py pins DECODE_RING_HEAP = 1 GiB; prefill_fwd.py pins the
-# rebalanced per-scope-depth (2, 2, 4, 8) GiB profile (pypto-lib#1073).  The
-# two programs fault under each other's sizing, so each dispatch carries its
-# own RunConfig instead of one process-wide value.
-DSPARK_DECODE_RING_HEAP = int(os.environ.get("PYPTO_DSPARK_DECODE_RING_HEAP", 1 << 30))
+# ---- per-dispatch ring heaps ----
+def _parse_decode_ring_heap(value: str | None) -> tuple[int, ...]:
+    """Parse per-depth byte counts; RunConfig validates the ring sizes."""
+    if value is None:
+        return (1 << 30, 1 << 30, 1 << 30, 4 << 30)
+    sizes = tuple(int(part) for part in value.split(","))
+    return sizes * 4 if len(sizes) == 1 else sizes
+
+
+# At 256 HCA pages the deepest decode scope retains a 1 GiB FP32 partial-O
+# tensor plus partial-M/L and stream state. Retained tensors across scopes
+# can exceed 2 GiB; the shallower scopes retain their original sizes.
+DSPARK_DECODE_RING_HEAP = _parse_decode_ring_heap(os.environ.get("PYPTO_DSPARK_DECODE_RING_HEAP"))
+DSPARK_MARKOV_RING_HEAP = 1 << 30
 DSPARK_PREFILL_RING_HEAP = (
     2 * 1024 * 1024 * 1024,
     2 * 1024 * 1024 * 1024,
@@ -159,7 +168,7 @@ DSPARK_MOE_TOKENS = 128
 # rows per rank, prefill selects each request's last row, and markov at most 16 * 7.
 DSPARK_MAX_LOGIT_ROWS = DSPARK_MOE_TOKENS
 DSPARK_SAMPLED_IDS_PAD = 8
-DSPARK_MAX_SEQ_LEN = 16384
+DSPARK_MAX_SEQ_LEN = 1_048_576
 
 # ---- decode metadata table depths (kernel-frozen) ----
 # The decode kernels' table types freeze their depths at the 1M-context
@@ -170,12 +179,12 @@ DSPARK_MAX_SEQ_LEN = 16384
 # tensor.h) and surfaces as an opaque AICore 507901 lane poison -- so the
 # decode depths must match prefill's exactly.  Unused entries are -1, and only
 # the leading per-request span is ever read.
-DSPARK_DECODE_ORI_TABLE_BLOCKS = 512
+DSPARK_DECODE_ORI_TABLE_BLOCKS = 32768
 DSPARK_DECODE_CMP_C4_TABLE_BLOCKS = 8192
 DSPARK_DECODE_IDX_TABLE_BLOCKS = 8192
-# The HCA cmp table's depth dim is dynamic (CMP_TABLE_BLOCKS_DYN); four pages
-# cover the 16K decode context (16384 / 128-token compression = 4 blocks).
-DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS = 4
+# The HCA cmp table's depth dim is dynamic (CMP_TABLE_BLOCKS_DYN); 256 pages
+# cover the full 1M context (1048576 / 128-token compression / 32 rows = 256 blocks).
+DSPARK_DECODE_HCA_CMP_TABLE_BLOCKS = 256
 DSPARK_DECODE_HCA_STATE_TABLE_BLOCKS = 131072
 DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS = 8
 
@@ -247,12 +256,17 @@ _PREFILL_LOCAL_DYNAMIC_NAMES = frozenset(
 )
 
 # ---- per-request ring sizes (scheduler-visible blocks per sequence) ----
-# The raw-KV ring must cover the sliding window plus the in-flight decode rows
-# crossing a page boundary; the HCA state ring covers one full 128-token
+# Prefill publishes the entire CP tile before attention reads any history.
+# Keep its maximum tile plus W-1 history rows, with one extra page for an
+# unaligned start; a decode-sized ring overwrites live KV from the next chunk.
+# The HCA state ring covers one full 128-token
 # compression window plus its 512-row prefill tile. The CSA working ring likewise
 # preserves the prefill tile plus the eight rows needed by the next ratio-4 pool.
 DSPARK_ORI_RING_BLOCKS = (
-    math.ceil((DSPARK_SLIDING_WINDOW - 1 + DSPARK_DECODE_SEQ) / DSPARK_BLOCK_SIZE) + 1
+    math.ceil(
+        (DSPARK_SLIDING_WINDOW - 1 + max(DSPARK_PREFILL_MAX_TOKENS, DSPARK_DECODE_SEQ))
+        / DSPARK_BLOCK_SIZE
+    ) + 1
 )
 DSPARK_HCA_STATE_RING_BLOCKS = 256
 DSPARK_CSA_STATE_RING_BLOCKS = 260
@@ -261,11 +275,6 @@ DSPARK_CSA_STATE_RING_BLOCKS = 260
 DSPARK_CSA_DECODE_STATE_RING_TOKENS = (
     DSPARK_DECODE_CSA_STATE_TABLE_BLOCKS * DSPARK_C4_STATE_PAGE_TOKENS
 )
-# Full-history groups at the 16K decode ceiling.
-DSPARK_CMP_C128_BLOCKS_PER_SEQ = 4
-DSPARK_CMP_C4_BLOCKS_PER_SEQ = 128
-DSPARK_IDX_BLOCKS_PER_SEQ = 128
-
 DSPARK_CACHE_GROUP_NAMES = (
     "ori",
     "cmp_c128",
@@ -330,6 +339,9 @@ def build_dspark_cache_group_specs(
             sliding_window=sliding_window,
         )
 
+    c128_blocks_per_seq = math.ceil(max_seq_len / (128 * DSPARK_BLOCK_SIZE))
+    c4_blocks_per_seq = math.ceil(max_seq_len / (4 * DSPARK_BLOCK_SIZE))
+
     return (
         group(
             "ori",
@@ -346,7 +358,7 @@ def build_dspark_cache_group_specs(
             block_size=128 * DSPARK_BLOCK_SIZE,
             element_bytes=2,
             row_width=DSPARK_HEAD_DIM,
-            max_blocks_per_seq=DSPARK_CMP_C128_BLOCKS_PER_SEQ,
+            max_blocks_per_seq=c128_blocks_per_seq,
             compress_ratio=128,
         ),
         group(
@@ -355,7 +367,7 @@ def build_dspark_cache_group_specs(
             block_size=4 * DSPARK_BLOCK_SIZE,
             element_bytes=2,
             row_width=DSPARK_HEAD_DIM,
-            max_blocks_per_seq=DSPARK_CMP_C4_BLOCKS_PER_SEQ,
+            max_blocks_per_seq=c4_blocks_per_seq,
             compress_ratio=4,
         ),
         group(
@@ -364,7 +376,7 @@ def build_dspark_cache_group_specs(
             block_size=4 * DSPARK_BLOCK_SIZE,
             element_bytes=1,
             row_width=DSPARK_IDX_HEAD_DIM,
-            max_blocks_per_seq=DSPARK_IDX_BLOCKS_PER_SEQ,
+            max_blocks_per_seq=c4_blocks_per_seq,
             compress_ratio=4,
             extra_row_bytes=4,
         ),
@@ -454,6 +466,8 @@ class DSparkCacheLayout:
                 "DSpark decode cache tables support at most "
                 f"max_seq_len={DSPARK_MAX_SEQ_LEN}, got {runtime.max_seq_len}"
             )
+        if runtime.max_seq_len > config.max_position_embeddings:
+            raise ValueError("DSpark max_seq_len exceeds checkpoint max_position_embeddings")
         global_decode_capacity = self.partitions * self.decode_batch
         if runtime.max_batch_size > global_decode_capacity:
             raise ValueError(
@@ -619,6 +633,29 @@ class DSparkCacheMetadataBuilder:
         slot = gathered * block_size + positions_i64 % block_size
         return torch.where(valid, slot, torch.full_like(slot, -1))
 
+    @staticmethod
+    def ring_slot_mapping(
+        positions: torch.Tensor,
+        block_ids_by_row: Sequence[Sequence[int]],
+        *,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Map absolute positions through compact per-request ring page lists."""
+        rows = []
+        for row_positions, block_ids in zip(positions, block_ids_by_row, strict=True):
+            ids = torch.tensor(
+                [int(block_id) for block_id in block_ids],
+                dtype=torch.long,
+                device=positions.device,
+            )
+            positions_i64 = row_positions.to(torch.int64)
+            logical = positions_i64 // int(block_size)
+            pages = ids.index_select(0, (logical % ids.numel()).reshape(-1)).reshape(
+                logical.shape
+            )
+            rows.append(pages * int(block_size) + positions_i64 % int(block_size))
+        return torch.stack(rows)
+
     def compressed_slot_mapping(
         self,
         positions: torch.Tensor,
@@ -660,34 +697,25 @@ class DSparkCacheMetadataBuilder:
         """Map absolute positions into ringed compressor-state pages."""
         return self.paged_slot_mapping(positions, table, block_size=state_page_tokens)
 
-    def swa_window_indices_and_lens(
+    def ring_swa_window_indices_and_lens(
         self,
         positions: torch.Tensor,
-        table: torch.Tensor,
+        block_ids_by_row: Sequence[Sequence[int]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Lower visible raw-KV window rows for each query row.
-
-        Every attention family consumes the same full window (the current
-        chunk's rows are part of it, read through the raw-KV ring slots), so
-        this is the one window lowering the decode step needs.
-        """
+        """Lower SWA windows directly from compact raw-KV ring page lists."""
         window = self.layout.sliding_window
-        block_size = self.layout.block_size
         positions_i64 = positions.to(torch.int64)
         batch, seq = positions_i64.shape
         start = (positions_i64 - window + 1).clamp(min=0)
         offsets = torch.arange(window, device=positions.device)
         visible = start.unsqueeze(-1) + offsets.unsqueeze(0).unsqueeze(0)
         valid = offsets.unsqueeze(0).unsqueeze(0) <= (positions_i64 - start).unsqueeze(-1)
-        logical = visible // block_size
-        depth = table.shape[-1]
-        gathered = self._gather_table(table, logical)
-        rows_valid = valid & (logical < depth) & (gathered >= 0)
-        indices = torch.where(
-            rows_valid,
-            gathered * block_size + visible % block_size,
-            torch.full_like(gathered, -1),
-        ).to(torch.int32)
+        indices = self.ring_slot_mapping(
+            visible,
+            block_ids_by_row,
+            block_size=self.layout.block_size,
+        )
+        indices = torch.where(valid, indices, torch.full_like(indices, -1)).to(torch.int32)
         lens = (positions_i64 - start + 1).clamp(min=0).to(torch.int32)
         return indices.reshape(batch * seq, window).contiguous(), lens.reshape(batch * seq)
 
@@ -939,15 +967,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._configure_l3_rings(runtime)
         from pypto.runtime import RunConfig  # noqa: PLC0415
 
-        # Decode always runs at the kernel's own 1 GiB heap; the runtime /
-        # CLI heap sizes prefill (the two profiles are mutually fatal).
+        # The runtime / CLI heap sizes prefill; decode has its own profile.
         self._decode_run_config = RunConfig(ring_heap=DSPARK_DECODE_RING_HEAP)
         if self.speculative:
-            # The drafter pins (4 GiB,)*4 for its own scope depths; markov's
-            # windows fit the same 1 GiB profile decode uses (the shared
-            # lm_head module), verified on the first device run.
+            # Markov does not allocate the target's HCA attention partials.
             self._drafter_run_config = RunConfig(ring_heap=DSPARK_DRAFTER_RING_HEAP)
-            self._markov_run_config = RunConfig(ring_heap=DSPARK_DECODE_RING_HEAP)
+            self._markov_run_config = RunConfig(ring_heap=DSPARK_MARKOV_RING_HEAP)
         record = self._compiled.runtime_model
         if record is None or not self._compiled.l3_callables():
             self._cache_group_num_blocks = dspark_cache_blocks_for_slots(
@@ -1689,6 +1714,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             args = self._prefill_dispatch_args(
                 inputs.physical_tokens, inputs.query_start_loc.shape[1] - 1
             )
+            self._trace_prefill_chunk(inputs, status="started")
             try:
                 with profile_span(
                     "DSparkModelRunner.prefill.l3_dispatch",
@@ -1712,11 +1738,28 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             tokens = [
                 int(sampled[rank, row, 0].item()) for rank, row in inputs.sampled_slots
             ]
+            self._trace_prefill_chunk(inputs, status="completed")
             return PrefillResult(
                 last_hidden=None,
                 logits=torch.zeros((len(tokens), 0)),
                 sampled_token_ids=torch.tensor(tokens, dtype=torch.long),
             )
+
+    def _trace_prefill_chunk(self, inputs: DSparkPreparedPrefillInputs, *, status: str) -> None:
+        if os.environ.get("PYPTO_DSPARK_TRACE_PREFILL") != "1":
+            return
+        # Completion is emitted only after synchronous L3 execution and output readback.
+        for request_id, group, start, actual in zip(
+            inputs.request_ids, inputs.groups, inputs.chunk_starts, inputs.actual_tokens, strict=True
+        ):
+            logger.info("DSpark prefill chunk: %s", json.dumps({
+                "request_id": request_id,
+                "group": group,
+                "start": start,
+                "logical_tokens": actual,
+                "physical_tokens": inputs.physical_tokens,
+                "status": status,
+            }, sort_keys=True))
 
     def _prefill_kernel_tokens(self, actual_tokens: int) -> int:
         """Return the TP-aligned packed extent, independent of individual context lengths."""
@@ -2515,18 +2558,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             tokens_flat = group_tokens[group].reshape(-1)
             anchor_flags = group_anchor_flags[group]
             starts = positions[:, 0]
-            # Per-request tables for the compact uniform group extent.
-            ori_tables = torch.stack(
-                [
-                    builder.ring_table(
-                        request_blocks[request_slot_of_group[(group, row)]]["ori"]
-                        if anchor_flags[row]
-                        else (scratch["ori"][row],),
-                        depth=DSPARK_DECODE_ORI_TABLE_BLOCKS,
-                    )
-                    for row in range(group_batch)
-                ]
-            )
+            # Raw KV is a compact rolling ring. Keep its page lists compact
+            # instead of materializing a 32768-entry logical table per request.
+            ori_block_ids = [
+                request_blocks[request_slot_of_group[(group, row)]]["ori"]
+                if anchor_flags[row]
+                else (scratch["ori"][row],)
+                for row in range(group_batch)
+            ]
             hca_cmp_tables = torch.stack(
                 [
                     builder.absolute_table(
@@ -2644,8 +2683,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             )
             raw_slots = torch.where(
                 committed_rows,
-                builder.paged_slot_mapping(
-                    positions, ori_tables, block_size=layout.block_size
+                builder.ring_slot_mapping(
+                    positions, ori_block_ids, block_size=layout.block_size
                 ),
                 torch.full_like(positions, -1),
             ).reshape(-1)
@@ -2701,7 +2740,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 torch.zeros_like(starts, dtype=torch.int32),
             )
             # Every attention family consumes the same raw-KV window lowering.
-            swa_indices, swa_lens = builder.swa_window_indices_and_lens(positions, ori_tables)
+            swa_indices, swa_lens = builder.ring_swa_window_indices_and_lens(
+                positions, ori_block_ids
+            )
             boundary_positions = (starts - starts % 128).clamp(min=0)
             hca_cmp_cos = rope.gather(rope.ratio128_half_cos, boundary_positions)
             hca_cmp_sin = rope.gather(rope.ratio128_half_sin, boundary_positions)

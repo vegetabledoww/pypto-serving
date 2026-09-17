@@ -37,11 +37,13 @@ Validated constraints (enforced at startup):
   compile a wrong expert view.
 - `--block-size 32` (the DSpark page size; the MTP variant uses 128).
 - `--max-num-seqs` at most 256 (64 requests per TP group).
-- `--max-model-len` at most 16384: the decode cache tables cap context at
-  16K until pypto-lib#905 extends them. Prefill itself is 1M-capable
-  (pypto-lib#1073), so longer prompts chunk through the 8192-token dispatch
-  bound whenever decode catches up.
+- `--max-model-len` at most 1,048,576, including prompt and generated output.
+  Prefill chunks long prompts through the 8192-token dispatch bound. Serving
+  sizes the full-history compressed and index pools from the configured limit,
+  while the raw KV and compressor-state pools remain bounded rings.
 - Prefix caching is forced off for now.
+
+The checkpoint's `max_position_embeddings` must cover the requested Serving limit.
 
 ## How the deployment maps onto the kernels
 
@@ -49,6 +51,11 @@ Validated constraints (enforced at startup):
   rank of a group holds an identical replicated pool: prefill writes the same
   rows on all four ranks, and decode rebuilds the group's whole KV stream
   from the gathered token rows each step (pypto-lib#1079).
+- **Long-context capacity is logical, not fully resident.** Ratio-128 history
+  grows to 256 pages per request at 1M; ratio-4 and index history grow to 8192
+  pages. Raw KV and HCA/CSA state remain rolling physical pools. Startup memory
+  admission still needs room for one complete logical-capacity request plus
+  scratch pages.
 - **Block tables are staged at the kernels' frozen depths** (CSA compressed
   and indexer tables 8192 entries, HCA compress-state table 131072, CSA
   compress-state tables 524288, -1 past
@@ -92,6 +99,20 @@ Validated constraints (enforced at startup):
   regathered on device.
 
 ## Ring heaps
+
+Target decode uses `(1, 1, 1, 4) GiB` at the four scope depths for the frozen
+1M layout. Its deepest scope retains partial-attention output, normalization,
+and stream tensors; a 1 GiB heap is insufficient. Markov uses a separate 1 GiB
+profile, and the drafter uses `(4, 4, 4, 4) GiB`.
+
+`PYPTO_DSPARK_DECODE_RING_HEAP` overrides only target decode. It accepts one
+byte count (broadcast to all four scope depths) or four comma-separated byte counts.
+PyPTO `RunConfig` validates the sizes: nonzero entries must be powers of two
+and at least 1024; zero leaves that scope at its runtime default. To retain the default profile, use
+`1073741824,1073741824,1073741824,4294967296`. A scalar `4294967296` instead
+allocates 4 GiB at every depth. The legacy scalar `1073741824` leaves the deepest
+scope at 1 GiB. Smaller overrides require separate device validation; they do
+not change the table ABI.
 
 The default DSpark ring heap is prefill's rebalanced profile,
 `(2, 2, 4, 8) GiB` per scope depth (pypto-lib#1073); the example command pins
