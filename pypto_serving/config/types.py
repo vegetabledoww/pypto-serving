@@ -110,6 +110,10 @@ class KVCacheGroupSpec:
     # matched page depends on the first token after that page. Its cache hash
     # includes that boundary token, and publication waits until it is known.
     is_eagle_group: bool = False
+    # Some MTP prefills materialize only this many trailing source-token
+    # states, including the final pending row. Earlier rows in a large chunk
+    # must not be published as complete prefix-cache pages.
+    prefill_tail_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -120,6 +124,9 @@ class KVCacheGroupSpec:
             raise ValueError("KV cache num_blocks must be positive when specified")
         if self.num_partitions <= 0:
             raise ValueError("KV cache num_partitions must be positive")
+        if self.prefill_tail_tokens is not None:
+            if self.prefill_tail_tokens <= 0 or not self.is_eagle_group:
+                raise ValueError("KV cache prefill_tail_tokens requires a positive EAGLE tail extent")
         if self.sliding_window is not None:
             if self.sliding_window <= 0:
                 raise ValueError("KV cache sliding_window must be positive")

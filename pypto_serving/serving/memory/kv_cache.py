@@ -871,12 +871,34 @@ class KvCacheManager:
             best_partition,
         )
 
+    def group_cache_valid_from_after_prefill(
+        self,
+        num_computed_tokens: int,
+        num_prefill_tokens: int,
+        valid_from: dict[str, int],
+    ) -> dict[str, int]:
+        """Track the contiguous valid suffix after a confirmed MTP prefill."""
+        updated = dict(valid_from)
+        for name, pool in self._group_pools.items():
+            tail_tokens = pool.spec.prefill_tail_tokens
+            if tail_tokens is not None and num_prefill_tokens >= tail_tokens:
+                # A full tail replaces the window without computing the prior
+                # chunk's pending row. Shorter chunks complete that row and
+                # extend the existing valid suffix instead.
+                updated[name] = max(
+                    updated.get(name, 0),
+                    num_computed_tokens - tail_tokens,
+                )
+        return updated
+
     def cache_group_blocks(
         self,
         request_id: str,
         block_hashes: dict[str, list[int]],
         num_computed_tokens: int,
         already_cached: dict[str, int],
+        *,
+        valid_from: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """Publish newly completed grouped pages and return cached counts."""
         if not self.enable_prefix_cache:
@@ -900,6 +922,9 @@ class KvCacheManager:
                 len(hashes),
             )
             start = min(cached_counts.get(name, 0), completed)
+            if valid_from is not None:
+                token_capacity = pool.spec.spec.token_capacity
+                start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
             if pool.spec.sliding_window is not None:
                 allocated = pool.request_logical_blocks.get(request_id, 0)
                 start = max(start, allocated - len(owned))
@@ -973,6 +998,8 @@ class KvCacheManager:
         already_cached: dict[str, int],
         block_ids_by_group: dict[str, list[int]],
         partition: int,
+        *,
+        valid_from: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """Publish confirmed pages using the exact table used by one step.
 
@@ -999,6 +1026,9 @@ class KvCacheManager:
                 len(hashes),
             )
             start = min(cached_counts.get(name, 0), completed)
+            if valid_from is not None:
+                token_capacity = pool.spec.spec.token_capacity
+                start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
             if pool.spec.sliding_window is not None:
                 if completed and not block_ids:
                     raise RuntimeError(f"Cache group {name!r} has an empty scheduled table")

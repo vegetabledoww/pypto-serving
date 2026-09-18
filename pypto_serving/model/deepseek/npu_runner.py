@@ -257,6 +257,7 @@ def build_deepseek_v4_cache_group_specs(
             num_partitions=DEEPSEEK_V4_RANKS,
             sliding_window=sliding_window,
             is_eagle_group=is_eagle_group,
+            prefill_tail_tokens=DEEPSEEK_V4_PREFILL_SEQ if is_eagle_group else None,
         )
 
     return (
